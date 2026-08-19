@@ -1,0 +1,24 @@
+# 환경 설정 (로컬 경로가 들어있음)
+.env
+
+# 가상환경 / IDE
+.venv/
+.vs/
+.idea/
+
+# 모델 가중치 (수 GB). 맨 앞 / 로 최상위만 지정한다.
+# 그냥 'models/' 로 쓰면 패키지 안의 ragmodul/models/ 까지 같이 빠진다.
+/models/
+
+# 원본 문서 및 파싱 산출물
+test_file/
+unpacked/
+
+# 빌드 산출물
+build/
+dist/
+*.egg-info/
+
+# 파이썬 캐시
+__pycache__/
+*.py[cod]

@@ -1,0 +1,17 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "ragmodul"
+version = "0.1.0"
+description = "hwpx 문서를 파싱·청킹·임베딩하는 RAG 처리 모듈"
+requires-python = ">=3.11"
+# hwpx / embedded-model 은 PyPI 에 없다. GitHub 저장소를 직접 가리킨다.
+#     "embedded-model @ git+https://github.com/zlfm78/TestEmbeddingModelRepository.git",
+dependencies = [
+    "hwpx @ git+https://github.com/WsuRagDocumentAssistant/HwpxParser_sub.git",
+]
+
+[tool.setuptools.packages.find]
+include = ["ragmodul*"]
