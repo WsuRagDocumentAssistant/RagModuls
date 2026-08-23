@@ -67,7 +67,7 @@ class DbService:
             self._conn.close()
             self._conn = None
 
-    # ── 저장 ────────────────────────────────────────────────────────────
+    #------------------------------------------------┌> 저장
 
     def save_document(self, document) -> int:
         """ChunkedDocument 를 통째로 저장하고 document.id 를 돌려준다.
@@ -143,7 +143,7 @@ class DbService:
                     document_id, len(document.parents), len(child_rows))
         return document_id
 
-    # ── 검색 ────────────────────────────────────────────────────────────
+    #------------------------------------------------┌> 검색
 
     def search(self, query_vector, top_k: int = 5, document_id: int | None = None) -> list[dict]:
         """dense 검색. child 로 찾고 parent 를 붙여 돌려준다.
@@ -292,7 +292,7 @@ class DbService:
             )
             return cur.fetchall()
 
-    # ── 조회 도우미 ──────────────────────────────────────────────────────
+    #------------------------------------------------┌> 조회 도우미
 
     def count(self) -> dict:
         """저장 결과를 눈으로 확인할 때 쓴다."""

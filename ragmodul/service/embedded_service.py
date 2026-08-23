@@ -70,7 +70,7 @@ class EmbeddedService:
     def unload(self) -> None:
         self._model.unload()
 
-    # ── 진단 ────────────────────────────────────────────────────────────
+    #------------------------------------------------┌> 진단
 
     def _log_device(self, count: int) -> None:
         """실제로 어느 장치에서 돌았는지 남긴다.

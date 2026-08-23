@@ -77,7 +77,7 @@ class RagController:
             sparse_dim=self._embedder.sparse_dimension,
         )
 
-    # ── 문서 등록 ────────────────────────────────────────────────────────
+    #------------------------------------------------┌> 문서 등록
 
     def parse_document(self, file_path: str):
         """hwpx 문서를 구조화된 DocumentModel로 만든다."""
@@ -115,7 +115,7 @@ class RagController:
         logger.info("DB 저장 완료: %d개", len(document.children()))
         return len(document.children())
 
-    # ── 질의 검색 ────────────────────────────────────────────────────────
+    #------------------------------------------------┌> 질의 검색
 
     def embed_query(self, query: str):
         """질의를 (dense 벡터, sparse 가중치) 로 만든다.
