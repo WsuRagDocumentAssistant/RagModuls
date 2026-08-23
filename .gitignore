@@ -24,11 +24,10 @@ __pycache__/
 *.py[cod]
 
 
-# sql 관련 설정
-sql/
+# 이미지 추출 산출물 (이 문서 기준 115MB)
+images/
 
 # 개인 테스트 환경
 tests/
 vocab_lab/
 main.py
-"main.py"  

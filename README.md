@@ -34,6 +34,7 @@ rag = RagController(
     embedding_model_path="models/bge-m3",
     reranker_model_path="models/bge-reranker-v2-m3",
     device="cuda",                    # None 이면 자동 감지
+    image_dir="images",               # 주면 문서 이미지를 빼낸다. None 이면 안 함
 )
 
 # 문서 등록
@@ -56,6 +57,24 @@ for c in contexts:
 
 설정은 전부 인자로 받는다. 환경변수나 `.env`를 읽지 않는다 — 설정을 어디서
 가져올지는 이 모듈을 쓰는 애플리케이션이 정할 일이다.
+
+`build_contexts`에 `limit`을 걸지 말 것. 약한 신호(유사도)로 미리 자른 뒤 강한
+신호(리랭커)에게 남은 것만 주면 정답이 잘린다 — 실측으로 recall이 93%에서 83%로
+떨어졌다. 후보를 다 넘기고 리랭커가 `top_k`로 줄이게 한다.
+
+### 이미지
+
+`image_dir`을 주면 문서에 들어있던 이미지를 `image_dir/<문서명>/`으로 빼낸다.
+(이 문서는 81개, 115MB.) 안 주면 복사하지 않는다 — 이미지는 `unpack_dir` 안에도
+풀려 있으므로 오래 둬야 하는 쪽만 켜면 된다.
+
+문서마다 하위 폴더를 만든다. 이미지 `ref`가 문서 안에서만 유일해서(`image1`,
+`image2`...) 문서 두 개를 처리하면 `image1.jpg`가 서로 덮어쓴다.
+
+**이미지는 검색에 들어가지 않는다.** 파서는 `role='그림'` 블록 39개에 위치 정보
+(`figure.image`, `heading_path_text`)까지 붙여주지만, 청킹이 `block.text`만 보고
+그림 블록은 `text=None`이라 색인에서 빠진다. 넣으려면 캡션이나 OCR 텍스트가 필요하다
+(`OcrService`가 그 자리다).
 
 ---
 
@@ -199,7 +218,7 @@ ragmodul/
 │  ├─ chunk_model.py          ChunkedDocument / ParentChunk / ChildChunk
 │  └─ search_model.py         RetrievedContext / RetrievedChild
 └─ service/
-   ├─ parser_service.py       hwpx 파싱 (parse 함수)
+   ├─ parser_service.py       hwpx 파싱 + 이미지 추출 (parse 함수)
    ├─ chunker_service.py      목차 기준 parent/child 분할 (chunk 함수)
    ├─ embedded_service.py     BGE-M3 dense + sparse
    ├─ reranker_service.py     CrossEncoder 리랭킹

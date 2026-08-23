@@ -37,6 +37,7 @@ class RagController:
         query_max_length: int = 8192,
         reranker_max_length: int = 512,
         unpack_dir: str = "unpacked",
+        image_dir: str | None = None,
         db_config: dict | None = None,
     ):
         """설정은 전부 인자로 받는다.
@@ -55,6 +56,7 @@ class RagController:
         self.query_max_length = query_max_length
         self.reranker_max_length = reranker_max_length
         self.unpack_dir = unpack_dir
+        self.image_dir = image_dir
         self.db_config = db_config
 
         self._embedder = EmbeddedService(
@@ -80,9 +82,12 @@ class RagController:
     #------------------------------------------------┌> 문서 등록
 
     def parse_document(self, file_path: str):
-        """hwpx 문서를 구조화된 DocumentModel로 만든다."""
+        """hwpx 문서를 구조화된 DocumentModel로 만든다.
+
+        image_dir 가 있으면 문서 이미지도 그 폴더로 빼낸다.
+        """
         logger.info("문서 파싱: %s", file_path)
-        return parse(file_path, unpack_dir=self.unpack_dir)
+        return parse(file_path, unpack_dir=self.unpack_dir, image_dir=self.image_dir)
 
     def chunk_parent_child(self, parsed) -> ChunkedDocument:
         """DocumentModel을 목차 기준 parent/child 청크로 나눈다."""

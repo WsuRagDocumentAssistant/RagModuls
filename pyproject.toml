@@ -22,8 +22,3 @@ dependencies = [
 
 [tool.setuptools.packages.find]
 include = ["ragmodul*"]
-
-# py.typed 는 .py 가 아니라서 자동으로 휠에 안 들어간다. 이 마커가 없으면
-# 타입 체커/IDE 가 패키지의 타입 힌트를 무시한다(PEP 561).
-[tool.setuptools.package-data]
-ragmodul = ["py.typed"]
