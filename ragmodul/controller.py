@@ -144,7 +144,10 @@ class RagController:
         조각 그대로 둔다 — 같은 본문이 여러 번 실려가는 걸 막고(실측: 본문의 56%가
         중복), 2/16 만 걸린 섹션에 수천 자를 붙이는 낭비도 없다.
 
-        여기 순서는 후보 선별용이다. 최종 순서는 리랭커가 정한다.
+        limit 은 기본으로 걸지 않는다. 약한 신호(유사도)로 미리 자른 뒤 강한 신호
+        (리랭커)에게 남은 것만 주는 건 순서가 거꾸로다. 실제로 limit=10 을 걸었다가
+        정답이 잘려 recall 이 93%->83% 로 떨어졌다. 리랭크 비용은 후보 수에 비례하지만
+        수십 개는 GPU 에서 무료에 가깝다.
         """
         contexts = RetrievedContext.from_rows(hits, merge_ratio=merge_ratio)
         merged = sum(1 for c in contexts if c.merged)

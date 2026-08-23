@@ -47,7 +47,7 @@ class RetrievedContext:
     parent_id: int
     content: str                    # LLM 에 실제로 넣을 텍스트
     merged: bool
-    score: float                    # 걸린 조각 점수의 평균
+    score: float                    # 대표 점수 = 걸린 조각 중 최고점 (평균이 아니다)
     children: list[RetrievedChild] = field(default_factory=list)
     heading: Optional[str] = None
     breadcrumb: str = ""
@@ -105,7 +105,13 @@ class RetrievedContext:
             ]
             head = hits[0]
             total = head.get("parent_child_count") or len(children)
-            avg = sum(c.similarity for c in children) / len(children)
+
+            # 대표 점수는 최고 자식이다. 평균으로 했다가 recall 이 93%->83% 로 떨어졌다.
+            # 이유: 승격되는 섹션은 조각이 많이 걸린 섹션인데, 많이 걸릴수록 평균에
+            # 딸려오는 낮은 형제도 많아져 점수가 내려간다 — 관련성이 높을수록 벌을 받는다.
+            # 실측: 정답 조각이 조각목록 1위(0.03279)였는데 형제 9개와 평균되어 0.02375,
+            # 맥락 14위로 밀려 잘렸다. 최고점을 쓰면 최고 자식보다 아래로 갈 수 없다.
+            best = max(c.similarity for c in children)
 
             if len(children) / total > merge_ratio:
                 # 승격: 섹션 본문 하나로 합친다. 조각 목록은 '어디가 맞았나'로 남긴다.
@@ -113,7 +119,7 @@ class RetrievedContext:
                     parent_id=parent_id,
                     content=head.get("content") or "",
                     merged=True,
-                    score=avg,
+                    score=best,
                     children=children,
                     heading=head.get("heading"),
                     breadcrumb=head.get("breadcrumb") or "",
