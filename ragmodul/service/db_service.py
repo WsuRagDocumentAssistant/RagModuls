@@ -40,10 +40,11 @@ DEFAULT_SPARSE_DIM = 250002
 class DbService:
 
     def __init__(self, config: dict | None = None, sparse_dim: int = DEFAULT_SPARSE_DIM) -> None:
-        self.config = dict(config or DB_CONFIG)
-        self.sparse_dim = sparse_dim
-        self._conn: psycopg.Connection | None = None
-        self.load()
+        pass
+        # self.config = dict(config or DB_CONFIG)
+        # self.sparse_dim = sparse_dim
+        # self._conn: psycopg.Connection | None = None
+        # self.load()
 
     def _to_sparsevec(self, weights) -> SparseVector | None:
         """{토큰id: 가중치} -> pgvector SparseVector.
