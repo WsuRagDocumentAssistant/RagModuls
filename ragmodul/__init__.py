@@ -1,3 +1,6 @@
+#================================================
+# __init__.py
+#================================================
 """
 RAG 처리 모듈.
 
@@ -18,17 +21,38 @@ RAG 처리 모듈.
     rag.save_to_vector_db(document)
 
     # 질의 검색
-    qvec = rag.embed_query("유학생 유치 수와 국가 수는?")
-    results = rag.hybrid_search(qvec, top_k=5)
-    results = rag.rerank("유학생 유치 수와 국가 수는?", results, top_k=3)
+    query = "유학생 유치 수와 국가 수는?"
+    qvec, qweights = rag.embed_query(query)
+    hits = rag.hybrid_search(qvec, qweights, top_k=40)   # 조각. 넉넉히 뽑는다
+    contexts = rag.build_contexts(hits, limit=10)        # LLM 입력 단위로 묶기
+    contexts = rag.rerank(query, contexts, top_k=5)      # 최종 순서
 """
 
-from .models.chunk_model import ChildChunk, ChunkedDocument, ParentChunk
 from .controller import RagController
+from .models.chunk_model import ChildChunk, ChunkedDocument, ParentChunk
+from .models.search_model import RetrievedChild, RetrievedContext
+from .service.chunker_service import chunk
+from .service.db_service import DbService
+from .service.embedded_service import EmbeddedService
+from .service.ocr_service import OcrService
+from .service.parser_service import parse
+from .service.reranker_service import RerankerService
 
 __all__ = [
+    # 진입점
     "RagController",
+    # 데이터 모델 — 청킹 결과
     "ChunkedDocument",
     "ParentChunk",
     "ChildChunk",
+    # 데이터 모델 — 검색 결과
+    "RetrievedContext",
+    "RetrievedChild",
+    # 단계별로 따로 쓰고 싶을 때
+    "parse",
+    "chunk",
+    "EmbeddedService",
+    "RerankerService",
+    "DbService",
+    "OcrService",
 ]

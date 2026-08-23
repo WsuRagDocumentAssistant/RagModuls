@@ -1,3 +1,6 @@
+#================================================
+# chunk_model.py
+#================================================
 """
 청킹 결과의 데이터 모델.
 
@@ -20,10 +23,16 @@ from typing import Any, Optional
 
 @dataclass
 class ChildChunk:
-    """검색 단위. content가 임베딩 대상이고 vector에 그 결과를 담는다."""
+    """검색 단위. content를 임베딩해 vector(dense)와 sparse(lexical)에 담는다.
+
+    BGE-M3는 한 텍스트에서 두 표현을 함께 뽑는다. dense는 의미가 비슷하면 잡고,
+    sparse는 같은 단어가 실제로 나왔는지를 잡는다. 고유명사나 수치처럼
+    '그 단어 자체'가 중요한 질의는 dense만으로는 놓쳐서 둘 다 쓴다.
+    """
     id: str
     content: str
-    vector: Optional[Any] = None      # numpy.ndarray, 임베딩 전에는 None
+    vector: Optional[Any] = None            # dense. numpy.ndarray, 임베딩 전에는 None
+    sparse: Optional[dict] = None           # lexical. {토큰id: 가중치}
 
     @property
     def is_embedded(self) -> bool:

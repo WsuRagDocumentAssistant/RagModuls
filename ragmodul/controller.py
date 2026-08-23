@@ -1,3 +1,6 @@
+#================================================
+# controller.py
+#================================================
 """
 RAG 처리 단계를 메서드로 제공한다.
 
@@ -11,9 +14,10 @@ RAG 처리 단계를 메서드로 제공한다.
 import logging
 
 from .models.chunk_model import ChunkedDocument
+from .models.search_model import DEFAULT_MERGE_RATIO, RetrievedContext
 from .service.chunker_service import chunk
 from .service.db_service import DbService
-# from .service.embedded_service import EmbeddedService
+from .service.embedded_service import EmbeddedService
 from .service.parser_service import parse
 from .service.reranker_service import RerankerService
 
@@ -33,6 +37,7 @@ class RagController:
         query_max_length: int = 8192,
         reranker_max_length: int = 512,
         unpack_dir: str = "unpacked",
+        db_config: dict | None = None,
     ):
         """설정은 전부 인자로 받는다.
 
@@ -50,18 +55,27 @@ class RagController:
         self.query_max_length = query_max_length
         self.reranker_max_length = reranker_max_length
         self.unpack_dir = unpack_dir
+        self.db_config = db_config
 
-        # self._embedder = EmbeddedService(
-        #     embedding_model_path,
-        #     device=device,
-        #     use_fp16=use_fp16,
-        #     passage_max_length=passage_max_length,
-        #     query_max_length=query_max_length,
-        # )
-        # self._reranker = RerankerService(
-        #     reranker_model_path, max_length=reranker_max_length, device=device
-        # )
-        self._db = DbService()
+        self._embedder = EmbeddedService(
+            embedding_model_path,
+            device=device,
+            use_fp16=use_fp16,
+            passage_max_length=passage_max_length,
+            query_max_length=query_max_length,
+        )
+        self._reranker = RerankerService(
+            reranker_model_path,
+            max_length=reranker_max_length,
+            device=device,
+            use_fp16=use_fp16,
+        )
+        # sparse 차원은 하드코딩하지 않고 모델에게 묻는다(= 토크나이저 vocab 크기).
+        # sql/schema.sql 의 SPARSEVEC(N) 과 이 값이 어긋나면 저장에서 실패한다.
+        self._db = DbService(
+            config=db_config,
+            sparse_dim=self._embedder.sparse_dimension,
+        )
 
     # ── 문서 등록 ────────────────────────────────────────────────────────
 
@@ -78,32 +92,66 @@ class RagController:
         return document
 
     def embed_bge_m3(self, document: ChunkedDocument) -> ChunkedDocument:
-        """각 child에 임베딩 벡터를 채워 넣는다. 같은 객체를 돌려준다."""
+        """각 child에 dense 벡터와 sparse 가중치를 채워 넣는다. 같은 객체를 돌려준다.
+
+        embedded 라이브러리가 dense/sparse 를 한 번에 주는 메서드를 열어두지 않아
+        forward 가 두 번 돈다. 합치려면 그쪽에 encode_all() 을 추가해야 한다.
+        """
         children = document.children()
-        # vectors = self._embedder.encode_documents([c.content for c in children])
-        # for child, vector in zip(children, vectors):
-        #     child.vector = vector
-        logger.info("임베딩 완료: %d개", len(children))
+        texts = [c.content for c in children]
+
+        vectors = self._embedder.encode_documents(texts)
+        weights = self._embedder.encode_sparse(texts)
+        for child, vector, weight in zip(children, vectors, weights):
+            child.vector = vector
+            child.sparse = weight
+
+        logger.info("임베딩 완료: %d개 (dense+sparse)", len(children))
         return document
 
     def save_to_vector_db(self, document: ChunkedDocument) -> int:
         """저장하고 저장한 child 수를 돌려준다."""
-        #self._db.save_document(document)
-        logger.info("DB 저장 완료")
+        self._db.save_document(document)
+        logger.info("DB 저장 완료: %d개", len(document.children()))
         return len(document.children())
 
     # ── 질의 검색 ────────────────────────────────────────────────────────
 
     def embed_query(self, query: str):
-        """질의 하나를 벡터로 만든다."""
-        logger.info("질의 백터회")
-        return #self._embedder.encode_queries([query])[0]
+        """질의를 (dense 벡터, sparse 가중치) 로 만든다.
 
-    def hybrid_search(self, query_vector, top_k: int = 5) -> list:
-        logger.info("검색")
-        #return self._db.search(query_vector, top_k)
+        검색이 둘 다 쓰므로 함께 돌려준다. 질의는 한 문장이라 두 번 호출해도
+        비용이 거의 없다(문서 임베딩과 달리).
+        """
+        logger.info("질의 임베딩: %s", query)
+        vector = self._embedder.encode_queries([query])[0]
+        weights = self._embedder.encode_sparse([query])[0]
+        return vector, weights
 
-    def rerank(self, query: str, results: list, top_k: int = 3) -> list:
-        logger.info("리랭크")
-        return list()
-        #return self._reranker.rerank(query, results, top_k)
+    def hybrid_search(self, query_vector, query_weights=None, top_k: int = 5) -> list:
+        """dense + sparse 를 RRF 로 합쳐 검색한다.
+
+        query_weights 가 없으면 dense 단독으로 떨어진다.
+        """
+        logger.info("검색: top_k=%d (%s)", top_k, "hybrid" if query_weights else "dense")
+        return self._db.search_hybrid(query_vector, query_weights, top_k)
+
+    def build_contexts(self, hits: list, merge_ratio: float = DEFAULT_MERGE_RATIO,
+                       limit: int | None = None) -> list[RetrievedContext]:
+        """검색된 조각을 LLM 입력 단위로 묶는다.
+
+        조각이 merge_ratio 이상 걸린 섹션만 본문으로 승격한다. 조금 걸린 섹션은
+        조각 그대로 둔다 — 같은 본문이 여러 번 실려가는 걸 막고(실측: 본문의 56%가
+        중복), 2/16 만 걸린 섹션에 수천 자를 붙이는 낭비도 없다.
+
+        여기 순서는 후보 선별용이다. 최종 순서는 리랭커가 정한다.
+        """
+        contexts = RetrievedContext.from_rows(hits, merge_ratio=merge_ratio)
+        merged = sum(1 for c in contexts if c.merged)
+        logger.info("맥락 조립: 조각 %d개 -> %d개 (승격 %d, 낱개 %d)",
+                    len(hits), len(contexts), merged, len(contexts) - merged)
+        return contexts[:limit] if limit else contexts
+
+    def rerank(self, query: str, contexts: list, top_k: int = 3) -> list:
+        logger.info("리랭크: %d개 -> top_k=%d", len(contexts), top_k)
+        return self._reranker.rerank(query, contexts, top_k)

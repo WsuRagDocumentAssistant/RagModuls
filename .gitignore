@@ -22,3 +22,12 @@ dist/
 # 파이썬 캐시
 __pycache__/
 *.py[cod]
+
+
+# sql 관련 설정
+sql/
+
+# 개인 테스트 환경
+tests/
+vocab_lab/
+main.py
