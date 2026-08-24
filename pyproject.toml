@@ -20,5 +20,14 @@ dependencies = [
     "pgvector",
 ]
 
+# llm_service 만 네트워크를 탄다. 검색만 쓰는 사람이 openai 를 깔 이유가 없어서
+# 선택적 의존성으로 뺀다.  pip install ragmodul[llm]
+#
+# ai-rag-comm(ServerCommunication)은 쓰지 않는다. 그 모듈이 (prompt, model,
+# max_tokens) 만 넘겨서 temperature / base_url / response_format 을 전달할 방법이
+# 없다. 세 층(RestChannel, 인터페이스, OpenAIService)이 다 고쳐지면 갈아탈 수 있다.
+[project.optional-dependencies]
+llm = ["openai"]
+
 [tool.setuptools.packages.find]
 include = ["ragmodul*"]

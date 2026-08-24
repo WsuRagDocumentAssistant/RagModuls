@@ -76,6 +76,101 @@ for c in contexts:
 그림 블록은 `text=None`이라 색인에서 빠진다. 넣으려면 캡션이나 OCR 텍스트가 필요하다
 (`OcrService`가 그 자리다).
 
+### LLM
+
+LLM 호출은 선택 기능이다. 검색만 쓸 거면 안 깔아도 된다.
+
+```bash
+pip install "ragmodul[llm] @ git+https://github.com/WsuRagDocumentAssistant/RagModuls.git"
+```
+
+기능 세 개다.
+
+```python
+from ragmodul.service.llm_service import LlmService
+
+llm = LlmService(api_key="sk-...", model="gpt-5.5")
+
+# 1. 검색 결과로 답변 생성
+contexts = rag.rerank(query, rag.build_contexts(hits), top_k=5)
+print(llm.answer(query, contexts))
+
+# 2. 문서에서 축약어 사전 만들기 — parent 단위로 부른다
+pairs = [p for parent in document.parents
+           for p in llm.extract_vocab(parent.content)]
+# [VocabPair(term='MD', expansion='마이크로디그리'), ...]
+
+# 3. 질의에서 축약어 뽑기 — 이걸 vocab_short 에서 찾아 확장어를 붙인다
+llm.extract_query_terms("MD 과정 운영 실적은?")     # ['MD']
+```
+
+**호출 하나 = 텍스트 하나.** 목록을 돌리는 건 부르는 쪽이 한다. 라이브러리가 삼키면
+어디서 실패했는지, 중간에 멈출지를 쓰는 쪽이 못 정한다.
+
+`extract_vocab` 을 `parent` 단위로 부르는 이유: 문서 전체를 한 번에 주면 6개, 부모별로
+주면 17~25개가 나왔다(실측). 긴 입력에서 놓친다.
+
+`answer()` 는 맥락마다 번호와 출처(breadcrumb)를 붙여 넘긴다. 어느 맥락을 근거로
+답했는지 확인할 수 있어야 하고, 한 섹션 안에 비슷한 항목이 여러 개일 때 구분에도
+쓰인다 — 실제로 `세부과제 2-1` 과 `2-2` 가 같은 3,011자 섹션에 들어 있고 2-1 이 앞에
+있는데, 이 형식으로 넘겼을 때 2-2 를 정확히 답했다.
+
+**설정은 인자로만 받는다.** `.env` 도 `config.json` 도 라이브러리가 읽지 않는다. 키를
+어디서 가져올지는 쓰는 애플리케이션이 정할 일이다.
+
+#### 로컬 LLM
+
+OpenAI 호환 엔드포인트면 `base_url` 로 돌린다. `/v1` 까지 주면 SDK 가
+`/chat/completions` 를 붙인다.
+
+```python
+llm = LlmService(
+    api_key="not-needed",                  # SDK 가 빈 값을 거부해서 아무 값이나 넣는다
+    model="gemma-4-12B-it",
+    base_url="http://호스트/v1",
+    headers={"x-user-id": "..."},
+    temperature=0.0,                       # 로컬 모델은 받는다
+)
+```
+
+모델 이름을 모르면 물어보면 된다.
+
+```python
+from openai import OpenAI
+OpenAI(api_key="not-needed", base_url="http://호스트/v1").models.list()
+```
+
+#### 프롬프트
+
+`ragmodul/prompt/prompt.py` 에 키워드로 등록해 두고 꺼내 쓴다. 기능마다 두 개다 —
+지시는 `_system`, 데이터는 `_user`.
+
+```python
+from ragmodul.prompt import get_prompt
+get_prompt("vocab_system")                      # 지시 (데이터 없음)
+get_prompt("vocab_user", text="...")            # 데이터
+```
+
+지시를 system 으로 분리하면 모델이 그걸 '따를 규칙'으로 다루고 데이터와 섞이지 않는다.
+
+#### 알아둘 제약
+
+- **`gpt-5.5` 는 `temperature` 를 거부한다.** `does not support 0.0 with this model.
+  Only the default (1) value is supported.` 그래서 기본값이 `None`(안 보냄)이고,
+  추출 결과가 실행마다 흔들린다 — 두 번 돌렸을 때 고유 축약어 17개 / 25개가 나왔고
+  정상 항목(`Pre-College`)이 한 번 빠졌다. 로컬 모델(`gemma-4-12B-it`)은 0 을 받으므로
+  재현이 필요한 작업은 그쪽이 유리하다.
+- **구조화 출력은 `structured=True`(기본)로 `response_format` 을 쓴다.** 서버가 그걸
+  못 받으면 `structured=False` — 지시에 JSON 스키마를 붙이고 평문에서 떼어내
+  pydantic 으로 검증한다. 실패하면 `retries` 만큼 다시 묻고, 끝까지 안 되면 그 텍스트만
+  건너뛴다(예외로 전체를 멈추지 않는다).
+- **`answer()` 는 구조화 출력을 쓰지 않는다.** 결과물이 서식(수치에 이탤릭·밑줄)이 붙은
+  평문이라 JSON 스키마로 감싸면 서식과 싸운다.
+- **`ai-rag-comm`([ServerCommunication](https://github.com/WsuRagDocumentAssistant/ServerCommunication))
+  은 쓰지 않는다.** `RestChannel` → `BaseLLMApiInterface.chat` → `OpenAIService` 세 층이
+  `(prompt, model, max_tokens)` 만 넘겨서 `base_url` 과 `response_format` 을 전달할
+  방법이 없다. 세 층이 다 고쳐지면 갈아탈 수 있다.
+
 ---
 
 ## 데이터 구조
@@ -216,14 +311,21 @@ ragmodul/
 ├─ controller.py              단계별 메서드. 서비스 생명주기를 스스로 관리한다
 ├─ models/
 │  ├─ chunk_model.py          ChunkedDocument / ParentChunk / ChildChunk
-│  └─ search_model.py         RetrievedContext / RetrievedChild
+│  ├─ search_model.py         RetrievedContext / RetrievedChild
+│  └─ vocab_model.py          VocabPair / VocabPairs / QueryTerms (LLM 출력 스키마)
+├─ prompt/
+│  └─ prompt.py               프롬프트 템플릿 + get_prompt(키, 데이터)
 └─ service/
    ├─ parser_service.py       hwpx 파싱 + 이미지 추출 (parse 함수)
    ├─ chunker_service.py      목차 기준 parent/child 분할 (chunk 함수)
    ├─ embedded_service.py     BGE-M3 dense + sparse
    ├─ reranker_service.py     CrossEncoder 리랭킹
    ├─ db_service.py           저장 / RRF 하이브리드 검색
+   ├─ llm_service.py          축약어 추출 (선택 의존성)
    └─ ocr_service.py          미구현
 ```
+
+`vocab_model.py` 만 dataclass 가 아니라 pydantic 이다. 이 모델이 LLM 출력의 검증
+스키마이면서 동시에 프롬프트에 붙일 JSON Schema 의 출처라 dataclass 로는 둘 다 안 된다.
 
 상태도 IO도 없는 작은 작업(`parse`, `chunk`)은 클래스로 감싸지 않고 함수로 둔다.

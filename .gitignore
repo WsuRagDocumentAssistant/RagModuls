@@ -31,3 +31,5 @@ images/
 tests/
 vocab_lab/
 main.py
+.env.example
+config.json
