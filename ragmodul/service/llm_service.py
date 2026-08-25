@@ -2,30 +2,42 @@
 # llm_service.py
 #================================================
 """
-LLM 호출 — openai SDK 를 직접 쓴다.
+LLM 호출 — ai-rag-comm 의 채널로 나간다.
 
-기능 두 개.
-  extract_vocab(text)         문서에서 축약어-확장어 짝을 뽑는다 (사전을 만들 때)
-  extract_query_terms(query)  사용자 질의에 나온 축약어를 뽑는다 (검색할 때)
+하나의 LlmService 가 provider 넷을 들고 관리한다. 호출할 때 고른다.
 
-프롬프트는 prompt/prompt.py, 출력 타입은 models/vocab_model.py 에 있다.
+    from ai_rag_comm import load_config
+    cfg = load_config()                       # config.json + .env
+    llm = LlmService(cfg.llm_api, cfg.local_llm, default="local_llm")
+
+    llm.answer(q, ctxs)                       # 기본 provider
+    llm.answer(q, ctxs, provider="gpt")
+    llm.merge(q, a, b, provider="claude")
+    await llm.aanswer(q, ctxs, provider="gemini")
+
+설정을 직접 읽지 않는다. ai-rag-comm 의 load_config() 결과를 받는다 — 모델명·엔드포인트·
+키·타임아웃이 이미 거기 다 있어서, 우리가 표를 또 만들면 두 곳이 어긋난다.
+
+provider 이름
+    gpt / claude / gemini    llm_api_config 에서. RestChannel 로 나간다.
+    local_llm                local_llm_config 에서. LocalLLMChannel 로 나간다.
+
+채널은 처음 쓸 때 만들어 붙들고 있다. 요청마다 만들면 연결이 쌓인다 — LocalLLMChannel 은
+같은 인자면 클라이언트를 재사용하지만(그쪽 캐시), 채널 객체를 매번 만드는 비용은 남는다.
+
+기능마다 async 본체와 동기 껍데기가 짝으로 있다. 채널이 async 라서 그렇다. 동기 쪽에서
+이미 이벤트 루프가 돌고 있으면 a- 접두사 쪽을 await 하면 된다.
+
+프롬프트는 prompt/prompt.py(지시/데이터 두 벌), 출력 타입은 models/vocab_model.py.
 이 파일은 '날리고 받아 검증하는' 일만 한다.
-
-ai-rag-comm 을 거치지 않는 이유
-  그 모듈은 RestChannel -> BaseLLMApiInterface.chat -> OpenAIService 세 층이
-  (prompt, model, max_tokens) 만 넘긴다. 그래서 아래 둘을 전달할 방법이 없다.
-    base_url         로컬 OpenAI 호환 엔드포인트를 부를 수 없다.
-    response_format  구조화 출력이 없어 평문에서 JSON 을 떼어내야 한다.
-  세 층을 다 고치면 쓸 수 있지만, 그때까지는 SDK 를 직접 부른다.
-  (temperature 도 못 넘기지만 그건 상관없다 — gpt-5.5 자체가 거부한다.)
-
-동기 클라이언트를 쓴다. 이 패키지의 다른 서비스가 다 동기라 asyncio 를 끌어들일
-이유가 없다.
 """
 
-import json
+import asyncio
 import logging
 import re
+import threading
+from dataclasses import dataclass, field
+from typing import Any
 
 from pydantic import BaseModel, ValidationError
 
@@ -34,89 +46,109 @@ from ..prompt import get_prompt
 
 logger = logging.getLogger(__name__)
 
-DEFAULT_MODEL = "gpt-5.5"
+CLOUD_PROVIDERS = ("gpt", "claude", "gemini")
+LOCAL_PROVIDER = "local_llm"
 
 # RAG 답변은 길다. 맥락 5개(5,000~6,000자)를 근거로 서술하면 답변만 수천 토큰이 되고,
-# 추론 토큰을 먼저 쓰는 모델(gemini-2.5)은 한도가 모자라면 content 가 빈 채로 온다
-# (실측: max_completion_tokens=16 에 응답이 None).
-DEFAULT_MAX_TOKENS = 8192
+# 추론 토큰을 먼저 쓰는 모델(gemini)은 한도가 모자라면 content 가 빈 채로 온다
+# (실측: max_tokens=16 에 응답이 None).
+CLOUD_MAX_TOKENS = 8192
+
+# 로컬 모델은 입력+출력 합쳐 8192 토큰이 상한이다. 출력에 다 주면 입력 자리가 0 이 되어
+# 400 이 난다("you requested 8192 output tokens ... upper bound for 0 input tokens").
+LOCAL_MAX_TOKENS = 2048
+
+# temperature 를 보내면 400 이 나는 provider. claude 는 ai-rag-comm 이 경고 후 무시하고,
+# gemini/local 은 정상으로 받는다. gpt 만 모델이 거부한다 —
+# "does not support 0.0 with this model. Only the default (1) value is supported".
+# 모델을 바꾸면(gpt-4o 등) 달라지므로 생성 시 덮어쓸 수 있다.
+NO_TEMPERATURE = ("gpt",)
 
 _FENCE = re.compile(r"```(?:json)?\s*(.*?)\s*```", re.DOTALL)
 
 
+@dataclass
+class _Provider:
+    """provider 하나의 설정과 채널. 채널은 처음 쓸 때 만든다."""
+    name: str
+    model: str
+    max_tokens: int
+    temperature: float | None = None
+    api_key: str = ""
+    base_url: str | None = None
+    headers: dict | None = None
+    timeout: float | None = None
+    llm_api_config: Any = field(default=None, repr=False)
+    channel: Any = field(default=None, repr=False)
+
+
 class LlmService:
 
-    def __init__(self, api_key: str, *, model: str = DEFAULT_MODEL,
-                 base_url: str | None = None, headers: dict | None = None,
-                 temperature: float | None = None, structured: bool = True,
-                 max_tokens: int = DEFAULT_MAX_TOKENS, retries: int = 1,
-                 timeout: float = 60.0) -> None:
-        """설정은 전부 인자로 받는다. 환경변수나 config.json 을 읽지 않는다.
+    def __init__(self, llm_api_config=None, local_llm_config=None, *,
+                 default: str | None = None,
+                 temperature: float | None = 0.0,
+                 no_temperature: tuple[str, ...] = NO_TEMPERATURE,
+                 structured: bool = True) -> None:
+        """ai-rag-comm 의 load_config() 결과를 받는다.
 
-        base_url:    OpenAI 호환 로컬 엔드포인트. '/v1' 까지 준다
-                     (예 'http://117.16.166.22/v1'). SDK 가 '/chat/completions' 를 붙인다.
-        headers:     엔드포인트가 요구하는 헤더. 예 {'x-user-id': 'npark-01'}
-        temperature: 기본은 None — 아예 안 보낸다. gpt-5.5 는 temperature 를 거부한다
-                     ("does not support 0.0 with this model. Only the default (1)").
-                     추출은 0 으로 고정하고 싶지만 이 모델로는 불가능하고, 그래서
-                     같은 문서에서도 결과가 흔들린다(실측 고유 축약어 17개 / 25개).
-                     받는 모델을 쓸 때만 값을 준다.
-        structured:  True 면 response_format 으로 스키마를 강제한다(API 가 보장).
-                     로컬 서버가 그걸 못 받으면 False — 프롬프트에 스키마를 붙이고
-                     평문에서 JSON 을 떼어낸다.
-        retries:     파싱이 실패했을 때 다시 물어볼 횟수.
+        Args:
+            llm_api_config:   cfg.llm_api. 없으면 클라우드 provider 를 안 만든다.
+            local_llm_config: cfg.local_llm. 없으면 local_llm 을 안 만든다.
+            default:          provider 를 안 넘겼을 때 쓸 이름.
+            temperature:      기본 0 — 같은 입력에 같은 결과가 나오게. no_temperature
+                              에 든 provider 에는 안 보낸다.
+            no_temperature:   temperature 를 거부하는 provider. 모델을 바꾸면 조정한다.
+            structured:       response_format 으로 스키마를 강제한다. 넷 다 지원하는
+                              것을 확인했다(로컬 포함, strict=True 까지).
         """
-        from openai import OpenAI
-
-        if not api_key:
-            raise ValueError(
-                "API 키가 필요합니다. 애플리케이션에서 읽어 넘기세요 "
-                "(이 라이브러리는 .env 나 config.json 을 직접 읽지 않습니다). "
-                "키를 안 받는 로컬 엔드포인트라도 SDK 가 빈 값을 거부하므로 아무 값이나 넣으세요."
-            )
-        self.model = model
-        self.temperature = temperature
         self.structured = structured
-        self.max_tokens = max_tokens
-        self.retries = retries
+        self._providers: dict[str, _Provider] = {}
 
-        self._client = OpenAI(api_key=api_key, base_url=base_url,
-                              default_headers=headers, timeout=timeout)
-        logger.info("LLM 준비: %s%s (temperature=%s, structured=%s)",
-                    model, f" @ {base_url}" if base_url else "", temperature, structured)
+        if llm_api_config is not None:
+            keys = {
+                "gpt": getattr(llm_api_config, "openai_api_key", ""),
+                "claude": getattr(llm_api_config, "anthropic_api_key", ""),
+                "gemini": getattr(llm_api_config, "gemini_api_key", ""),
+            }
+            models = getattr(llm_api_config, "default_models", {}) or {}
+            for name in CLOUD_PROVIDERS:
+                if not keys[name] or name not in models:
+                    continue        # 키나 모델이 없으면 그 provider 는 만들지 않는다
+                self._providers[name] = _Provider(
+                    name=name, model=models[name], max_tokens=CLOUD_MAX_TOKENS,
+                    temperature=None if name in no_temperature else temperature,
+                    api_key=keys[name],
+                    timeout=getattr(llm_api_config, "timeout", None),
+                    llm_api_config=llm_api_config,
+                )
 
-    #------------------------------------------------┌> 기능
+        if local_llm_config is not None:
+            self._providers[LOCAL_PROVIDER] = _Provider(
+                name=LOCAL_PROVIDER,
+                model=local_llm_config.model,
+                max_tokens=LOCAL_MAX_TOKENS,
+                temperature=None if LOCAL_PROVIDER in no_temperature else temperature,
+                base_url=local_llm_config.base_url,
+                headers=getattr(local_llm_config, "headers", None),
+                timeout=getattr(local_llm_config, "timeout", None),
+            )
 
-    def extract_vocab(self, text: str) -> list[VocabPair]:
-        """문서 텍스트 하나에서 축약어 짝을 뽑는다.
+        if not self._providers:
+            raise ValueError(
+                "쓸 수 있는 provider 가 없습니다. llm_api_config 에 키와 default_models 가 "
+                "있는지, local_llm_config 가 있는지 확인하세요."
+            )
+        self.default = default or next(iter(self._providers))
+        if self.default not in self._providers:
+            raise ValueError(
+                f"default {self.default!r} 를 만들지 못했습니다 "
+                f"(가능: {', '.join(self._providers)}). 키나 모델 설정을 확인하세요."
+            )
+        logger.info("LLM 준비: %s (기본 %s)", ", ".join(self._providers), self.default)
 
-        호출 하나 = 텍스트 하나다. 여러 개를 돌리는 건 부르는 쪽이 한다 — 이 모듈이
-        목록을 삼키면 어디서 실패했는지, 중간에 멈출지를 쓰는 쪽이 통제할 수 없다.
+    #------------------------------------------------┌> 답변 (async 본체)
 
-            pairs = [p for parent in document.parents
-                       for p in llm.extract_vocab(parent.content)]
-        """
-        result = self.send(get_prompt("vocab_user", text=text), VocabPairs,
-                           system=get_prompt("vocab_system"))
-        if result is None:
-            logger.warning("축약어 추출 실패: %s...", text[:40])
-            return []
-        return list(result.pairs)
-
-
-
-    def extract_query_terms(self, query: str) -> list[str]:
-        """사용자 질의에 나온 축약어를 뽑는다. 이걸 vocab_short 에서 찾아 확장어를 붙인다."""
-        result = self.send(get_prompt("query_terms_user", query=query), QueryTerms,
-                           system=get_prompt("query_terms_system"))
-        if result is None:
-            logger.warning("질의 축약어 추출 실패: %s", query[:40])
-            return []
-        return [t.strip() for t in result.terms if t and t.strip()]
-
-
-
-    def answer(self, query: str, contexts: list) -> str:
+    async def aanswer(self, query: str, contexts: list, provider: str | None = None) -> str:
         """검색된 맥락으로 질문에 답한다.
 
         contexts 는 rerank() 를 지난 RetrievedContext 목록이다. 출처(breadcrumb)를
@@ -124,119 +156,274 @@ class LlmService:
         한 섹션 안에 비슷한 항목이 여러 개 있을 때(세부과제 2-1 과 2-2 처럼) 구분에도
         쓰인다.
 
-        구조화 출력을 쓰지 않는다. 서식(수치에 이탤릭·밑줄)이 붙은 평문이 결과물이라
+        구조화 출력을 쓰지 않는다. 결과물이 서식(수치에 이탤릭·밑줄)이 붙은 평문이라
         JSON 스키마로 감싸면 서식과 싸운다.
         """
         block = _format_contexts(contexts)
-        text = self.ask(
-            get_prompt("answer_user", context=block, query=query),
-            system=get_prompt("answer_system"),
-        )
-        logger.info("답변 생성: 맥락 %d개(%d자) -> %d자", len(contexts), len(block), len(text))
+        system, user = get_prompt("answer", context=block, query=query)
+        text = await self.aask(user, provider, system=system)
+        logger.info("[%s] 답변: 맥락 %d개(%d자) -> %d자",
+                    provider or self.default, len(contexts), len(block), len(text))
         return text
 
-
-
-    def merge(self, question: str, answer_a: str, answer_b: str) -> str:
+    async def amerge(self, question: str, answer_a: str, answer_b: str,
+                     provider: str | None = None) -> str:
         """LLM 두 개가 낸 답변을 하나로 합친다.
 
-        사용자가 provider 를 둘 고르면 각 LlmService 에 따로 answer() 를 부르고
-        그 결과를 여기에 넘긴다. 어느 LLM 으로 병합할지는 부르는 쪽이 정한다 —
-        이 메서드를 가진 서비스가 병합을 수행한다.
-
-            a = services["gpt"].answer(q, ctxs)
-            b = services["local_llm"].answer(q, ctxs)
-            final = services["gpt"].merge(q, a, b)
-
-        두 개까지만 받는다. 프롬프트가 '두 AI' 를 전제로 쓰여 있어서, 셋을 넣으려면
-        프롬프트부터 바꿔야 한다.
+        어느 provider 로 병합할지는 부르는 쪽이 정한다 — 답변을 낸 것과 달라도 된다.
+        두 개까지만 받는다. 프롬프트가 '두 AI' 를 전제로 쓰여 있다.
         """
         if not answer_a or not answer_b:
-            # 한쪽이 비면 합칠 게 없다. 있는 쪽을 그대로 준다.
             logger.warning("병합할 답변이 하나뿐이다. 그대로 돌려준다.")
             return answer_a or answer_b or ""
 
-        text = self.ask(
-            get_prompt("merge_user", question=question, answer_a=answer_a, answer_b=answer_b),
-            system=get_prompt("merge_system"),
-        )
-        logger.info("병합: %d자 + %d자 -> %d자", len(answer_a), len(answer_b), len(text))
+        system, user = get_prompt("merge", question=question,
+                                  answer_a=answer_a, answer_b=answer_b)
+        text = await self.aask(user, provider, system=system)
+        logger.info("[%s] 병합: %d자 + %d자 -> %d자",
+                    provider or self.default, len(answer_a), len(answer_b), len(text))
         return text
 
+    #------------------------------------------------┌> 축약어 사전 (async 본체)
 
+    async def aextract_vocab(self, text: str, provider: str | None = None) -> list[VocabPair]:
+        """텍스트에서 축약어 짝을 뽑는다.
 
-    def ask(self, prompt: str, system: str | None = None) -> str:
-        """평문 답변. 구조화 출력을 쓰지 않는 호출에 쓴다."""
-        completion = self._client.chat.completions.create(
-            model=self.model,
-            messages=_messages(prompt, system),
-            max_completion_tokens=self.max_tokens,
-            **self._temperature_arg(),
-        )
-        return completion.choices[0].message.content or ""
+        문서 전체를 한 덩어리로 넣는다. 부모별로 나눠 32번 부르면 표기 변형
+        (7-Core / 7-CORE)을 모델이 정리하지 못한다 — 각 호출이 자기 텍스트만 보기
+        때문이다. 놓치는 건 recheck_vocab 으로 메운다.
 
-    #------------------------------------------------┌> 전송
+        로컬 모델은 컨텍스트가 8192 토큰이라 문서 전체(약 45k)를 못 받는다. 클라우드로.
+        """
+        system, user = get_prompt("vocab", text=text)
+        result = await self.asend(user, VocabPairs, provider, system=system)
+        if result is None:
+            logger.warning("축약어 추출 실패: %s...", text[:40])
+            return []
+        return list(result.pairs)
 
-    def send(self, prompt: str, schema: type[BaseModel],
-             system: str | None = None) -> BaseModel | None:
-        """완성된 프롬프트를 날려 schema 로 돌려준다. 끝까지 실패하면 None.
+    async def arecheck_vocab(self, text: str, found: list[VocabPair],
+                             provider: str | None = None) -> list[VocabPair]:
+        """이미 뽑은 목록을 보여주고 빠뜨린 축약어를 다시 훑게 한다.
+
+        한 번에 다 못 뽑는다. 실측 — 1차 11개, 재검토로 7개 추가(JA, K-MOOC, IPA,
+        CEFR 등)해서 18개. 부모별 32회(14개)보다 많고 호출은 2회다.
+
+        새로 찾은 것만 돌려준다. 합치는 건 부르는 쪽이 한다.
+        """
+        listing = "\n".join(f"- {p.term} -> {p.expansion}" for p in found) or "(없음)"
+        system, user = get_prompt("vocab_recheck", found=listing, text=text)
+        result = await self.asend(user, VocabPairs, provider, system=system)
+        if result is None:
+            logger.warning("축약어 재검토 실패")
+            return []
+        # 모델이 이미 있는 것을 다시 낼 때가 있어 여기서 한 번 더 거른다.
+        known = {(p.term, p.expansion) for p in found}
+        fresh = [p for p in result.pairs if (p.term, p.expansion) not in known]
+        logger.info("재검토: %d개 중 새로 %d개", len(result.pairs), len(fresh))
+        return fresh
+
+    async def aextract_query_terms(self, query: str, provider: str | None = None) -> list[str]:
+        """사용자 질의에 나온 축약어를 뽑는다. 이걸 vocab_short 에서 찾아 확장어를 붙인다."""
+        system, user = get_prompt("query_terms", query=query)
+        result = await self.asend(user, QueryTerms, provider, system=system)
+        if result is None:
+            logger.warning("질의 축약어 추출 실패: %s", query[:40])
+            return []
+        return [t.strip() for t in result.terms if t and t.strip()]
+
+    #------------------------------------------------┌> 전송 (async 본체)
+
+    async def asend(self, prompt: str, schema: type[BaseModel],
+                    provider: str | None = None, system: str | None = None,
+                    retries: int = 1) -> BaseModel | None:
+        """스키마를 강제해 받고 검증한다. 끝까지 실패하면 None.
+
+        structured 면 response_format 으로 API 가 형식을 보장한다. 아니면 지시 뒤에
+        JSON Schema 를 붙이고 평문에서 떼어낸다 — 데이터가 길 때(문서 전체 추출은
+        9만 자) 형식 지시가 앞에 있으면 묻히므로 뒤에 붙인다.
 
         예외로 올리지 않는 이유: 청크 수백 개를 돌리는 중에 하나가 어긋났다고
         전체가 멈출 이유가 없다.
         """
-        for attempt in range(self.retries + 1):
-            result = (self._parse(prompt, schema, system) if self.structured
-                      else self._parse_text(prompt, schema, system))
-            if result is not None:
-                return result
-            logger.warning("응답 파싱 실패 (%d/%d)", attempt + 1, self.retries + 1)
+        fmt = _bare_schema(schema) if self.structured else None
+        if not self.structured:
+            import json
+            system = (system or "") + (
+                "\n\n아래 JSON 스키마에 정확히 맞는 JSON 만 출력한다. 설명이나 코드펜스 없이 JSON 만.\n"
+                f"{json.dumps(schema.model_json_schema(), ensure_ascii=False, indent=2)}"
+            )
+
+        name = provider or self.default
+        for attempt in range(retries + 1):
+            text = await self.aask(prompt, provider, system=system, response_format=fmt)
+            parsed = _extract(schema, text)
+            if parsed is not None:
+                return parsed
+            logger.warning("[%s] JSON 파싱 실패 (%d/%d)", name, attempt + 1, retries + 1)
         return None
 
-    def _parse(self, prompt: str, schema: type[BaseModel],
-               system: str | None) -> BaseModel | None:
-        """response_format 으로 스키마를 강제한다. 형식이 어긋날 수가 없다."""
-        completion = self._client.chat.completions.parse(
-            model=self.model,
-            messages=_messages(prompt, system),
-            response_format=schema,
-            max_completion_tokens=self.max_tokens,
-            **self._temperature_arg(),
+    async def aask(self, prompt: str, provider: str | None = None,
+                   system: str | None = None,
+                   response_format: dict | None = None) -> str:
+        """채널로 보내고 평문을 받는다.
+
+        response_format 에는 '알맹이' JSON Schema 만 넣는다. provider 별 봉투는
+        ai-rag-comm 이 씌운다 — 우리가 미리 씌우면 이중으로 감싸져 400 이 난다.
+        """
+        prov = self._provider(provider)
+        payload: dict[str, Any] = {
+            "prompt": prompt,
+            "model": prov.model,
+            "max_tokens": prov.max_tokens,
+        }
+        if system:
+            payload["system"] = system
+        if prov.temperature is not None:
+            payload["temperature"] = prov.temperature
+        if response_format is not None:
+            payload["response_format"] = response_format
+        return await self._channel(prov).call(payload) or ""
+
+    #------------------------------------------------┌> 동기 껍데기
+
+    def answer(self, query: str, contexts: list, provider: str | None = None) -> str:
+        return _run(self.aanswer(query, contexts, provider))
+
+    def merge(self, question: str, answer_a: str, answer_b: str,
+              provider: str | None = None) -> str:
+        return _run(self.amerge(question, answer_a, answer_b, provider))
+
+    def extract_vocab(self, text: str, provider: str | None = None) -> list[VocabPair]:
+        return _run(self.aextract_vocab(text, provider))
+
+    def recheck_vocab(self, text: str, found: list[VocabPair],
+                      provider: str | None = None) -> list[VocabPair]:
+        return _run(self.arecheck_vocab(text, found, provider))
+
+    def extract_query_terms(self, query: str, provider: str | None = None) -> list[str]:
+        return _run(self.aextract_query_terms(query, provider))
+
+    def ask(self, prompt: str, provider: str | None = None,
+            system: str | None = None, response_format: dict | None = None) -> str:
+        return _run(self.aask(prompt, provider, system, response_format))
+
+    #------------------------------------------------┌> 관리
+
+    def providers(self) -> list[str]:
+        """쓸 수 있는 provider 이름."""
+        return list(self._providers)
+
+    async def aclose(self) -> None:
+        """만들어둔 채널의 연결을 정리한다. 프로세스 종료 시 한 번.
+
+        LocalLLMChannel 만 aclose() 를 가진다. RestChannel 은 없어서(그쪽 미구현)
+        클라우드 연결은 프로세스가 끝날 때 OS 가 정리한다.
+        """
+        for prov in self._providers.values():
+            closer = getattr(prov.channel, "aclose", None)
+            if closer is not None:
+                await closer()
+            prov.channel = None
+
+    def close(self) -> None:
+        _run(self.aclose())
+
+    #------------------------------------------------┌> 내부
+
+    def _provider(self, provider: str | None) -> _Provider:
+        name = provider or self.default
+        prov = self._providers.get(name)
+        if prov is None:
+            raise KeyError(
+                f"모르는 provider: {name!r} (있는 것: {', '.join(self._providers)})")
+        return prov
+
+    def _channel(self, prov: _Provider):
+        """채널을 처음 쓸 때 만들어 붙들고 있는다.
+
+        생성자에서 다 만들지 않는 이유: 넷을 등록해도 실제로 쓰는 건 한둘일 때가 많고,
+        채널을 만들면 HTTP 클라이언트와 연결 풀이 생긴다.
+        """
+        if prov.channel is not None:
+            return prov.channel
+
+        if prov.base_url:
+            from ai_rag_comm import LocalLLMChannel
+
+            prov.channel = LocalLLMChannel(
+                prov.base_url, prov.model, prov.headers, prov.timeout)
+            logger.info("[%s] LocalLLMChannel @ %s", prov.name, prov.base_url)
+        else:
+            from ai_rag_comm import AIProvider, RestChannel
+
+            prov.channel = RestChannel(
+                prov.llm_api_config, AIProvider(prov.name), prov.model)
+            logger.info("[%s] RestChannel / %s", prov.name, prov.model)
+        return prov.channel
+
+
+#------------------------------------------------┌> 모듈 내부
+
+# 루프를 스레드마다 하나씩 둔다.
+#   - asyncio.run 을 호출마다 쓰면 루프가 매번 닫히고, 채널의 HTTP 클라이언트가 그
+#     루프에 묶여 있어 연결이 정리되지 못한다(실측: 호출 6회에 unclosed socket 6개).
+#   - 그래서 루프를 재사용하는데, 전역 하나로 두면 스레드 두 개가 같은 루프를 밀어넣어
+#     "This event loop is already running" 이 난다(실측: 스레드 3개 중 2개 실패).
+#     FastAPI 가 동기 엔드포인트를 스레드풀에 던지는 경우가 그렇다.
+_local = threading.local()
+
+
+def _run(coro):
+    """코루틴을 동기로 돌린다. 이미 루프 안이면 무엇을 해야 하는지 알려주고 멈춘다."""
+    try:
+        asyncio.get_running_loop()
+    except RuntimeError:
+        pass
+    else:
+        coro.close()    # 안 닫으면 "coroutine was never awaited" 경고가 따라온다
+        raise RuntimeError(
+            "이미 async 안에서 동기 메서드를 불렀습니다. a- 접두사 쪽을 await 하세요 "
+            "(answer -> aanswer, extract_vocab -> aextract_vocab)."
         )
-        message = completion.choices[0].message
-        if getattr(message, "refusal", None):
-            logger.warning("모델이 거부: %s", message.refusal)
-            return None
-        return message.parsed
 
-    def _parse_text(self, prompt: str, schema: type[BaseModel],
-                    system: str | None) -> BaseModel | None:
-        """구조화 출력을 못 쓸 때. 스키마를 지시에 붙이고 평문에서 떼어낸다."""
-        schema_note = (
-            "\n\n아래 JSON 스키마에 정확히 맞는 JSON 만 출력한다. 설명이나 코드펜스 없이 JSON 만.\n"
-            f"{json.dumps(schema.model_json_schema(), ensure_ascii=False, indent=2)}"
-        )
-        completion = self._client.chat.completions.create(
-            model=self.model,
-            messages=_messages(prompt, (system or "") + schema_note),
-            max_completion_tokens=self.max_tokens,
-            **self._temperature_arg(),
-        )
-        return _extract(schema, completion.choices[0].message.content or "")
-
-    def _temperature_arg(self) -> dict:
-        """None 이면 아예 안 보낸다 — 일부 모델은 temperature 자체를 거부한다."""
-        return {} if self.temperature is None else {"temperature": self.temperature}
+    loop = getattr(_local, "loop", None)
+    if loop is None or loop.is_closed():
+        loop = _local.loop = asyncio.new_event_loop()
+    return loop.run_until_complete(coro)
 
 
-#------------------------------------------------┌> 내부
+def _bare_schema(schema: type[BaseModel]) -> dict:
+    """pydantic 모델을 '알맹이' JSON Schema 로 바꾼다.
 
-def _messages(prompt: str, system: str | None) -> list[dict]:
-    """지시는 system, 데이터는 user 로 나눠 담는다."""
-    messages = []
-    if system:
-        messages.append({"role": "system", "content": system})
-    messages.append({"role": "user", "content": prompt})
-    return messages
+    provider 별 봉투는 ai-rag-comm 이 씌운다. 우리가 OpenAI 봉투를 미리 씌우면 이중으로
+    감싸져 안쪽 스키마의 type 이 'json_schema' 가 되고 400 이 난다 — 에러 메시지가
+    provider 마다 달라서(Grammar error / Invalid schema for response_format /
+    unrecognized type at top-level) 원인이 같다는 걸 알아채기 어렵다.
+
+    strict 모드(ai-rag-comm 기본값)는 중첩된 모든 object 에 additionalProperties: false
+    와 '모든 속성이 required' 를 요구한다. pydantic 이 $defs 에 만드는 중첩 객체까지 훑는다.
+    """
+    json_schema = schema.model_json_schema()
+    _strictify(json_schema)
+    return json_schema
+
+
+def _strictify(node) -> None:
+    """스키마 트리를 돌며 object 마다 strict 요구사항을 채운다. 제자리에서 고친다."""
+    if isinstance(node, list):
+        for item in node:
+            _strictify(item)
+        return
+    if not isinstance(node, dict):
+        return
+
+    if node.get("type") == "object":
+        node["additionalProperties"] = False
+        node["required"] = list(node.get("properties", {}))
+
+    for value in node.values():
+        _strictify(value)
 
 
 def _format_contexts(contexts: list) -> str:
@@ -263,7 +450,8 @@ def _format_contexts(contexts: list) -> str:
 def _extract(schema: type[BaseModel], text: str) -> BaseModel | None:
     """평문에서 JSON 을 떼어내 검증한다.
 
-    모델이 코드펜스나 앞뒤 설명을 붙이는 일이 흔해서 그대로 파싱하면 실패한다.
+    response_format 을 쓰면 형식이 보장되지만, 못 쓰는 엔드포인트에서는 모델이 코드펜스나
+    앞뒤 설명을 붙인다. 그대로 파싱하면 실패하므로 떼어낸다.
     """
     if not text:
         return None

@@ -167,9 +167,11 @@ get_prompt("vocab_user", text="...")            # 데이터
 - **`answer()` 는 구조화 출력을 쓰지 않는다.** 결과물이 서식(수치에 이탤릭·밑줄)이 붙은
   평문이라 JSON 스키마로 감싸면 서식과 싸운다.
 - **`ai-rag-comm`([ServerCommunication](https://github.com/WsuRagDocumentAssistant/ServerCommunication))
-  은 쓰지 않는다.** `RestChannel` → `BaseLLMApiInterface.chat` → `OpenAIService` 세 층이
-  `(prompt, model, max_tokens)` 만 넘겨서 `base_url` 과 `response_format` 을 전달할
-  방법이 없다. 세 층이 다 고쳐지면 갈아탈 수 있다.
+  은 아직 쓰지 않는다.** 막혀 있던 것들(`base_url`/`default_headers`/`timeout`,
+  `temperature`, `load_config()` 경로, 버전 핀, 로컬 LLM 채널)은 그쪽 리팩토링으로
+  해결됐고, 남은 건 `response_format` 하나다 — `chat()` 이 그 인자를 안 받아서
+  구조화 출력을 강제할 수 없다. 그것만 되면 갈아탈 수 있다.
+  자세한 내용은 [`docs/ServerCommunication-수정요청.md`](docs/ServerCommunication-수정요청.md).
 
 ---
 

@@ -39,6 +39,9 @@ class RagController:
         unpack_dir: str = "unpacked",
         image_dir: str | None = None,
         db_config: dict | None = None,
+        llm_api_config=None,
+        local_llm_config=None,
+        llm_default: str | None = None,
     ):
         """설정은 전부 인자로 받는다.
 
@@ -47,6 +50,10 @@ class RagController:
         import 시점 값에 기본값을 묶어두면 쓰는 쪽이 예측할 수 없다.
 
         device=None 이면 라이브러리가 자동 감지한다(GPU 있으면 GPU).
+
+        llm_api_config / local_llm_config 는 ai-rag-comm 의 load_config() 결과를
+        넘긴다(cfg.llm_api, cfg.local_llm). 둘 다 없으면 self.llm 은 None 이고
+        검색까지만 된다.
         """
         self.embedding_model_path = embedding_model_path
         self.reranker_model_path = reranker_model_path
@@ -58,6 +65,9 @@ class RagController:
         self.unpack_dir = unpack_dir
         self.image_dir = image_dir
         self.db_config = db_config
+        self.llm_api_config = llm_api_config
+        self.local_llm_config = local_llm_config
+        self.llm_default = llm_default
 
         self._embedder = EmbeddedService(
             embedding_model_path,
@@ -78,6 +88,15 @@ class RagController:
             config=db_config,
             sparse_dim=self._embedder.sparse_dimension,
         )
+        # LLM 설정을 안 준 사람은 LLM 스택을 안 깐 사람이다(ragmodul[llm] 은 선택
+        # 의존성). import 를 여기 두는 건 그래서다 — 모듈 맨 위에 두면 검색만 쓰는
+        # 사람이 ragmodul 을 import 조차 못 한다. 객체 자체는 만들어 둔다. 설정을
+        # _Provider 넷으로 정리할 뿐이고 채널은 처음 쓸 때 각자 만든다.
+        self.llm = None
+        if llm_api_config is not None or local_llm_config is not None:
+            from .service.llm_service import LlmService
+
+            self.llm = LlmService(llm_api_config, local_llm_config, default=llm_default)
 
     #------------------------------------------------┌> 문서 등록
 
@@ -163,3 +182,27 @@ class RagController:
     def rerank(self, query: str, contexts: list, top_k: int = 3) -> list:
         logger.info("리랭크: %d개 -> top_k=%d", len(contexts), top_k)
         return self._reranker.rerank(query, contexts, top_k)
+
+    #------------------------------------------------┌> 답변 생성 (선택 의존성)
+
+    def answer(self, query: str, contexts: list, provider: str | None = None) -> str:
+        """검색된 맥락으로 답변을 만든다. rerank() 다음 단계다."""
+        return self._require_llm().answer(query, contexts, provider=provider)
+
+    async def aanswer(self, query: str, contexts: list, provider: str | None = None) -> str:
+        """answer() 의 async 판. 이미 이벤트 루프 안이면 이쪽을 await 한다."""
+        return await self._require_llm().aanswer(query, contexts, provider=provider)
+
+    def _require_llm(self):
+        if self.llm is None:
+            raise ValueError(
+                "LLM 설정이 없습니다. RagController(..., llm_api_config=cfg.llm_api, "
+                "local_llm_config=cfg.local_llm) 로 넘기세요 "
+                "(cfg = ai_rag_comm.load_config())."
+            )
+        return self.llm
+
+    def close(self) -> None:
+        """만들어둔 연결을 정리한다. 프로세스 종료 시 한 번."""
+        if self.llm is not None:
+            self.llm.close()

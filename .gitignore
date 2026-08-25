@@ -33,3 +33,4 @@ vocab_lab/
 main.py
 .env.example
 config.json
+docs/
