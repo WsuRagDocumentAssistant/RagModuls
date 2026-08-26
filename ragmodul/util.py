@@ -5,12 +5,20 @@
 순수 계산 도우미. 모델도 DB도 네트워크도 쓰지 않는다.
 """
 
+import logging
 import re
 
 from .models.vocab_model import VocabPair
 
+logger = logging.getLogger(__name__)
+
 # 확장어에 콜론이 있으면 풀어쓴 말이 아니라 정의 문장이다.
 _COLON = re.compile(r"[:：]")
+
+_SPACE = re.compile(r"\s+")
+
+# 영문·숫자로 시작하는 표기. 이런 건 단어 경계로 찾는다.
+_ASCII_KEY = re.compile(r"^[A-Za-z0-9][A-Za-z0-9.+\-]*$")
 
 # 풀어쓴 말은 이름이라 짧고 설명은 길다. 실측 —
 #   정상 최대 49자 'Common European Framework of Reference of Language'
@@ -88,4 +96,100 @@ def _reject(term: str, expansion: str, skip: set[str],
 
 def _norm(text: str) -> str:
     """공백을 없앤다. 표기 변형을 흡수해야 비교가 된다."""
-    return re.sub(r"\s+", "", text or "")
+    return _SPACE.sub("", text or "")
+
+
+#------------------------------------------------┌> 질의 확장
+
+def expand_query(query: str, vocab: dict[str, list[str]] | None) -> str:
+    """질의에 걸리는 표기의 짝을 뒤에 덧붙인다. 원문은 그대로 둔다.
+
+    vocab 은 load_vocab() 이 주는 {축약어: [확장어, ...]} 다.
+
+    왜 문서가 아니라 질의인가
+      색인 쪽에 확장어를 박으면 그 말이 실제보다 흔해 보여 IDF 가 떨어지고 sparse 가
+      변별력을 잃는다 — 도우려는 짓이 망친다. 사전을 고칠 때마다 재색인해야 하는
+      문제도 있다. Elasticsearch 도 query-time 을 권한다.
+
+    왜 치환이 아니라 덧붙이기인가
+      치환하면 원래 표기로 물어본 사람을 놓친다. 덧붙이면 잃는 게 없다.
+
+    dense·sparse 양쪽에 같은 확장 질의를 쓴다. 실측(문서 하나, 사례 8건) —
+        dense  개선 5 / 악화 0 / 변화없음 3
+        sparse 개선 3 / 악화 0 / 변화없음 5
+    둘은 서로 보완한다. '대학성과통합관리 시스템' 은 sparse 가 못 잡고 dense 가 잡고,
+    'MD' 는 sparse 가 더 많이 잡는다. 어느 쪽도 나빠진 사례가 없어 함께 쓴다.
+
+    다만 그 8건은 'A 표기로 묻고 B 표기만 있는 청크를 목표로' 만든 사례다. 사전
+    단어가 스치듯 들어간 평범한 질의가 나빠지는지는 재지 못했다(평가셋 30문항 중
+    사전을 건드리는 질문이 0개였다).
+    """
+    if not query or not vocab:
+        return query
+
+    index = _expansion_index(vocab)
+    norm_query = _norm(query)
+    additions: list[str] = []
+
+    for key, values in index.items():
+        if not _in_query(key, query, norm_query):
+            continue
+        for value in values:
+            # 이미 질의에 있는 말은 덧붙이지 않는다
+            if _norm(value) not in norm_query and value not in additions:
+                additions.append(value)
+
+    if not additions:
+        return query
+    logger.debug("질의 확장: +%s", additions)
+    return f"{query} {' '.join(additions)}"
+
+
+def _expansion_index(vocab: dict[str, list[str]]) -> dict[str, list[str]]:
+    """{축약어: [확장어]} 를 양방향 조회표로 바꾼다.
+
+    양방향이어야 질의 한쪽만 건드려서 문서 양쪽을 덮는다. 문서에는 축약어만 적힌
+    청크도 있고 풀어쓴 말만 적힌 청크도 있는데 문서를 못 고치기 때문이다.
+        'IR' 이 오면            -> '대학성과통합관리 시스템' 을 덧붙인다
+        '대학성과통합관리' 가 오면 -> 'IR' 을 덧붙인다
+
+    같은 축약어에 달린 다른 표기 변형끼리도 서로 덧붙인다(PAMS 의 Asia/Asian).
+
+    사전이 십여 개라 질의마다 만들어도 비용이 없다. 미리 만들어 들고 다니면 사전을
+    고쳤을 때 낡은 색인을 쓰게 된다.
+    """
+    index: dict[str, list[str]] = {}
+
+    def add(key: str, values: list[str]) -> None:
+        if not key:
+            return
+        bucket = index.setdefault(key, [])
+        for value in values:
+            if value and value not in bucket:
+                bucket.append(value)
+
+    for short, expansions in vocab.items():
+        short = (short or "").strip()
+        expansions = [e.strip() for e in expansions if e and e.strip()]
+        if not short or not expansions:
+            continue
+        add(short, expansions)
+        for expansion in expansions:
+            add(expansion, [short] + [e for e in expansions if e != expansion])
+    return index
+
+
+def _in_query(key: str, query: str, norm_query: str) -> bool:
+    """이 표기가 질의에 나오나.
+
+    영문·숫자 축약어는 단어 경계로 본다. 부분문자열로 찾으면 'IR' 이 'IRB' 나
+    'FIRST' 에 걸려 엉뚱한 확장어가 붙는다. 경계를 [A-Za-z0-9] 아님으로 잡으므로
+    'IR성과관리팀' 처럼 한글이 바로 붙은 경우는 정상적으로 걸린다.
+
+    한글이 섞인 표기는 공백만 무시하고 부분문자열로 본다. 긴 구절이라 오탐 위험이
+    낮고, 조사가 붙어도('시스템은') 앞부분이 걸려야 한다.
+    """
+    if _ASCII_KEY.match(key):
+        pattern = rf"(?<![A-Za-z0-9]){re.escape(key)}(?![A-Za-z0-9])"
+        return re.search(pattern, query, re.IGNORECASE) is not None
+    return _norm(key) in norm_query

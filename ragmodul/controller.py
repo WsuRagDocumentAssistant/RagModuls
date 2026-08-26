@@ -15,11 +15,13 @@ import logging
 
 from .models.chunk_model import ChunkedDocument
 from .models.search_model import DEFAULT_MERGE_RATIO, RetrievedContext
+from .models.vocab_model import VocabPair
 from .service.chunker_service import chunk
 from .service.db_service import DbService
 from .service.embedded_service import EmbeddedService
 from .service.parser_service import parse
 from .service.reranker_service import RerankerService
+from .util import expand_query, filter_vocab_pairs
 
 logger = logging.getLogger(__name__)
 
@@ -141,15 +143,25 @@ class RagController:
 
     #------------------------------------------------┌> 질의 검색
 
-    def embed_query(self, query: str):
+    def embed_query(self, query: str, vocab: dict[str, list[str]] | None = None):
         """질의를 (dense 벡터, sparse 가중치) 로 만든다.
 
         검색이 둘 다 쓰므로 함께 돌려준다. 질의는 한 문장이라 두 번 호출해도
         비용이 거의 없다(문서 임베딩과 달리).
+
+        vocab 을 주면(load_vocab() 결과) 축약어의 짝을 질의에 덧붙여서 임베딩한다.
+        dense·sparse 양쪽에 같은 확장 질의를 쓴다 — 실측에서 둘 다 좋아졌고 나빠진
+        사례가 없었다. 자세한 근거는 util.expand_query 에 적어뒀다.
+
+        vocab=None 이면 확장하지 않는다. 기존 호출부는 그대로 동작한다.
         """
-        logger.info("질의 임베딩: %s", query)
-        vector = self._embedder.encode_queries([query])[0]
-        weights = self._embedder.encode_sparse([query])[0]
+        text = expand_query(query, vocab)
+        if text != query:
+            logger.info("질의 임베딩(확장): %s", text)
+        else:
+            logger.info("질의 임베딩: %s", query)
+        vector = self._embedder.encode_queries([text])[0]
+        weights = self._embedder.encode_sparse([text])[0]
         return vector, weights
 
     def hybrid_search(self, query_vector, query_weights=None, top_k: int = 5) -> list:
@@ -192,6 +204,50 @@ class RagController:
     async def aanswer(self, query: str, contexts: list, provider: str | None = None) -> str:
         """answer() 의 async 판. 이미 이벤트 루프 안이면 이쪽을 await 한다."""
         return await self._require_llm().aanswer(query, contexts, provider=provider)
+
+    #------------------------------------------------┌> 축약어 사전
+
+    def extract_vocab(self, text: str, provider: str | None = None) -> list[VocabPair]:
+        """글에서 축약어/확장어 짝을 뽑는다. LLM 한 번.
+
+        문서를 통째로 넘긴다. 부모 단위로 쪼개 돌리면 호출이 32 번인데 결과는 17 개고,
+        통째로 한 번(12 개) 뒤에 recheck_vocab 을 한 번 더 돌리면 18 개다 — 호출 2 번이
+        더 많이 찾는다. 쪼개면 문서 앞뒤에 흩어진 '축약어 ... 풀어쓴 말' 을 못 잇는다.
+
+        로컬 모델은 컨텍스트가 8192 토큰이라 문서 전체가 안 들어간다. 클라우드
+        provider 를 쓰거나, 로컬로 하려면 글을 잘라서 여러 번 불러야 한다.
+        """
+        return self._require_llm().extract_vocab(text, provider=provider)
+
+    def recheck_vocab(self, text: str, found: list[VocabPair],
+                      provider: str | None = None) -> list[VocabPair]:
+        """이미 뽑은 목록을 주고 빠뜨린 것만 더 찾는다. LLM 한 번.
+
+        한 번에 훑으면 뒷부분을 놓친다(실측: 11 개 -> 재검토로 7 개 추가).
+        돌려주는 건 새로 찾은 것만이므로, found 와 합쳐서 쓴다.
+        """
+        return self._require_llm().recheck_vocab(text, found, provider=provider)
+
+    def filter_vocab(self, pairs: list[VocabPair], skip: set[str] | None = None):
+        """못 쓸 짝을 걸러낸다. (통과, [(버린 짝, 이유)]) — 모델도 DB도 안 쓴다.
+
+        완벽한 선별이 아니라 사람이 검수할 양을 줄이는 것이 목적이다. 통과한 것에도
+        고칠 것이 남으므로 save_vocab 전에 눈으로 본다.
+        """
+        return filter_vocab_pairs(pairs, skip)
+
+    def save_vocab(self, pairs: list[VocabPair]) -> int:
+        """검수한 짝을 DB 에 넣고 새로 들어간 확장어 수를 돌려준다.
+
+        같은 것을 또 넣어도 늘지 않는다 — 재실행해도 사전이 부풀지 않는다.
+        """
+        return self._db.save_vocab(pairs)
+
+    def load_vocab(self) -> dict[str, list[str]]:
+        """{축약어: [확장어, ...]}. 질의 확장이 이 형태로 쓴다."""
+        return self._db.load_vocab()
+
+    #------------------------------------------------┌> 내부
 
     def _require_llm(self):
         if self.llm is None:

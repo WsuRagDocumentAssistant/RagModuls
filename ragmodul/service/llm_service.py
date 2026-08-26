@@ -102,6 +102,7 @@ class LlmService:
                               것을 확인했다(로컬 포함, strict=True 까지).
         """
         self.structured = structured
+        self._closed = False
         self._providers: dict[str, _Provider] = {}
 
         if llm_api_config is not None:
@@ -317,9 +318,17 @@ class LlmService:
     async def aclose(self) -> None:
         """만들어둔 채널의 연결을 정리한다. 프로세스 종료 시 한 번.
 
-        LocalLLMChannel 만 aclose() 를 가진다. RestChannel 은 없어서(그쪽 미구현)
-        클라우드 연결은 프로세스가 끝날 때 OS 가 정리한다.
+        되돌릴 수 없다. ai-rag-comm 의 클라이언트 캐시가 모듈 전역이라, 닫고 나면
+        채널을 새로 만들어도 닫힌 클라이언트를 돌려받는다. 다시 쓰려면 LlmService
+        자체를 새로 만들어야 한다.
+
+        LocalLLMChannel 만 aclose() 를 가진다. RestChannel 은 그 메서드를 밖으로
+        내보내지 않는다 — 미구현이 아니라 전달 누락이다. 감싸고 있는
+        OpenAIService/ClaudeService/GeminiService 에는 셋 다 aclose() 가 있다.
+        남의 패키지 비공개 속성(channel._client)을 건드리지 않기로 하고, 클라우드
+        연결은 프로세스가 끝날 때 OS 가 정리하게 둔다.
         """
+        self._closed = True
         for prov in self._providers.values():
             closer = getattr(prov.channel, "aclose", None)
             if closer is not None:
@@ -327,7 +336,9 @@ class LlmService:
             prov.channel = None
 
     def close(self) -> None:
+        """동기 쪽에서 부르는 정리. 채널을 닫고 이 스레드의 루프까지 닫는다."""
         _run(self.aclose())
+        _close_loop()
 
     #------------------------------------------------┌> 내부
 
@@ -345,6 +356,15 @@ class LlmService:
         생성자에서 다 만들지 않는 이유: 넷을 등록해도 실제로 쓰는 건 한둘일 때가 많고,
         채널을 만들면 HTTP 클라이언트와 연결 풀이 생긴다.
         """
+        # close() 뒤에는 채널을 다시 만들어도 못 쓴다. ai-rag-comm 의 _client_cache 가
+        # 모듈 전역이라 닫힌 클라이언트를 그대로 돌려주고, 그때 나는 에러가
+        # APIConnectionError("Connection error") 라서 망 문제로 보인다(실측).
+        # 여기서 미리 막아 원인을 알려준다.
+        if self._closed:
+            raise RuntimeError(
+                "이미 close() 한 LlmService 입니다. close() 는 종료용이라 되돌릴 수 "
+                "없습니다 — 다시 쓰려면 LlmService 를 새로 만드세요."
+            )
         if prov.channel is not None:
             return prov.channel
 
@@ -391,6 +411,22 @@ def _run(coro):
     if loop is None or loop.is_closed():
         loop = _local.loop = asyncio.new_event_loop()
     return loop.run_until_complete(coro)
+
+
+def _close_loop() -> None:
+    """이 스레드의 루프를 닫는다. 채널을 다 닫은 뒤에만 부른다.
+
+    안 닫으면 종료 때 "unclosed event loop" 가 뜬다(실측).
+
+    shutdown_asyncgens 는 asyncio.run 이 하는 것과 같다 — HTTP 스트리밍처럼 아직
+    안 끝난 async 제너레이터가 남아 있으면 루프가 닫힌 뒤에 정리되려다 터진다.
+    """
+    loop = getattr(_local, "loop", None)
+    if loop is None or loop.is_closed():
+        return
+    loop.run_until_complete(loop.shutdown_asyncgens())
+    loop.close()
+    _local.loop = None
 
 
 def _bare_schema(schema: type[BaseModel]) -> dict:
