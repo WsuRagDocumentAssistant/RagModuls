@@ -20,6 +20,40 @@ import os
 
 logger = logging.getLogger(__name__)
 
+# 최종 자리에 담을 한 부모당 조각 수. 한 부모가 자리를 독점하는 걸 막는다.
+#
+# 왜 필요한가(실측): child 22개인 부모에서 3개가 걸렸는데, 승격 기준이 hit 비율 0.5
+# 라서 섹션으로 묶이지 않고 조각 셋이 최종 5칸 중 3칸을 먹었다. 큰 부모는 12개가
+# 걸려야 승격되는데 후보를 40개 뽑는 상황에서 그런 일은 거의 없다.
+#
+# 그 조각들은 앞부분을 공유한다 — 표를 쪼갤 때 머리글을 조각마다 붙이기 때문이다.
+# 그래서 LLM 이 거의 같은 글을 세 번 보고 출처는 두 곳으로 줄어든다.
+#
+# 2 인 이유: 한 섹션 안에 답이 두 군데 흩어진 경우를 살리면서 독점만 막는다.
+DEFAULT_MAX_PER_PARENT = 2
+
+
+def _limit_per_parent(ordered: list, top_k: int, max_per_parent: int) -> list:
+    """점수순 목록에서 부모당 개수를 제한해 top_k 를 고른다.
+
+    제한 때문에 자리를 못 채우면 제한을 풀고 남은 것으로 메운다 — 안 그러면 답이 한
+    섹션에만 있는 질의에서 맥락이 한두 개로 줄어 지금보다 나빠진다.
+    """
+    picked: list = []
+    per_parent: dict = {}
+    for context in ordered:
+        parent = getattr(context, "parent_id", None)
+        if per_parent.get(parent, 0) >= max_per_parent:
+            continue
+        picked.append(context)
+        per_parent[parent] = per_parent.get(parent, 0) + 1
+        if len(picked) == top_k:
+            return picked
+
+    taken = {id(c) for c in picked}
+    picked.extend(c for c in ordered if id(c) not in taken)
+    return picked[:top_k]
+
 
 class RerankerService:
 
@@ -64,7 +98,8 @@ class RerankerService:
 
         logger.info("리랭커 로드 완료: %s (device=%s, fp16=%s)", model_path, self.device, self.use_fp16)
 
-    def rerank(self, query: str, contexts: list, top_k: int) -> list:
+    def rerank(self, query: str, contexts: list, top_k: int,
+               max_per_parent: int | None = DEFAULT_MAX_PER_PARENT) -> list:
         """contexts 를 재정렬해 상위 top_k 를 돌려준다.
 
         contexts 는 rerank_text(읽기)와 rerank_score(쓰기)를 가진 객체여야 한다
@@ -74,6 +109,9 @@ class RerankerService:
         기존 점수(similarity/score)는 건드리지 않는다. 예전에 그걸 덮어써서 화면에
         코사인 유사도인 것처럼 표시된 적이 있다.
         점수는 0~1 — 라벨이 1개인 리랭커라 CrossEncoder 가 sigmoid 를 기본으로 씌운다.
+
+        max_per_parent 는 최종 자리에 한 부모의 조각을 몇 개까지 담을지다. None 이면
+        제한하지 않는다.
         """
         if not contexts:
             return contexts
@@ -87,4 +125,6 @@ class RerankerService:
             context.rerank_score = float(score)
 
         ordered = sorted(contexts, key=lambda c: c.rerank_score, reverse=True)
-        return ordered[:top_k]
+        if max_per_parent is None:
+            return ordered[:top_k]
+        return _limit_per_parent(ordered, top_k, max_per_parent)

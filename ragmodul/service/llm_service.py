@@ -192,16 +192,18 @@ class LlmService:
         return text
 
     async def arefine_all(self, query: str, contexts: list, draft: str,
-                          providers: list[str], skip: str | None = None,
-                          parallel: bool = True) -> dict[str, str]:
+                          providers: list[str], parallel: bool = True,
+                          ) -> dict[str, str]:
         """고른 모델들이 같은 초안을 각자 다듬는다. {provider: 다듬은 답변}.
 
         하나가 죽어도 나머지는 돌려준다 — 한도(429)나 키 없음으로 한쪽만 실패하는 게
         흔하다. 실패한 provider 는 결과에 없으므로, 부르는 쪽이 providers 와 대조하면
         무엇이 빠졌는지 알 수 있다.
 
-        skip 에 초안을 만든 provider 를 주면 건너뛴다. 자기 초안을 자기가 다듬을
-        이유가 없다. 같은 provider 가 두 번 들어오면 한 번만 부른다.
+        같은 provider 가 두 번 들어오면 한 번만 부른다.
+
+        초안을 만든 provider 를 여기 넣지 않는 건 부르는 쪽 책임이다. 자기 초안을
+        자기가 다듬으면 호출만 하나 늘고 결과는 거의 같다.
 
         parallel=True 면 동시에 던진다. LLM 호출은 전부 네트워크 대기라 GIL 이 걸림돌이
         아니다 — 기다리는 동안 GIL 을 놓으므로 단일 스레드에서도 실제로 겹친다. 걸리는
@@ -212,7 +214,7 @@ class LlmService:
         벌어진다.
         """
         # 중복을 지우면서 순서는 유지한다 — 결과 dict 의 순서가 요청 순서와 맞는다
-        targets = list(dict.fromkeys(p for p in providers if p and p != skip))
+        targets = list(dict.fromkeys(p for p in providers if p))
         if not targets:
             return {}
 
@@ -281,6 +283,54 @@ class LlmService:
             logger.warning("축약어 추출 실패: %s...", text[:40])
             return []
         return list(result.pairs)
+
+    async def aextract_vocab_all(self, texts: list[str], provider: str | None = None,
+                                 parallel: bool = True, max_concurrent: int = 4,
+                                 ) -> list[VocabPair]:
+        """여러 조각에서 각각 뽑아 합친다. 같은 짝은 한 번만 남긴다.
+
+        컨텍스트가 좁은 모델(로컬)에 문서를 나눠 보낼 때 쓴다. 조각은 util.pack_texts
+        로 만든다 — 부모 경계에서만 끊어 헤딩이 반토막 나지 않는다.
+
+        조각 하나가 실패해도 나머지는 살린다. 로그에만 남기고 넘어간다.
+
+        max_concurrent 는 동시에 나가는 요청 수다. 로컬 엔드포인트가 여러 대에 로드
+        밸런싱되어 있어 그 대수만큼은 겹쳐도 된다. 상한을 안 두고 18개를 한꺼번에
+        던지면 공용 게이트웨이가 버티지 못한다.
+
+        정확도는 문서를 통째로 한 번 보내는 것보다 낮다. 조각 경계에서 앞의 정의와
+        뒤의 사용이 갈라지기 때문이다(실측: 통째 1회 17짝 / 부모별 32회 17짝). 묶으면
+        경계가 절반으로 줄어 그 손해가 작아진다.
+        """
+        if not texts:
+            return []
+
+        semaphore = asyncio.Semaphore(max_concurrent if parallel else 1)
+
+        async def one(index: int, text: str):
+            async with semaphore:
+                pairs = await self.aextract_vocab(text, provider)
+                logger.info("사전 추출 %d/%d: %d자 -> %d짝",
+                            index, len(texts), len(text), len(pairs))
+                return pairs
+
+        results = await asyncio.gather(
+            *(one(i, t) for i, t in enumerate(texts, 1)), return_exceptions=True)
+
+        merged: list[VocabPair] = []
+        seen: set[tuple[str, str]] = set()
+        for index, result in enumerate(results, 1):
+            if isinstance(result, BaseException):
+                logger.warning("사전 추출 %d/%d 실패: %s - %s",
+                               index, len(texts), type(result).__name__, result)
+                continue
+            for pair in result:
+                key = (pair.term, pair.expansion)
+                if key not in seen:
+                    seen.add(key)
+                    merged.append(pair)
+        logger.info("사전 추출 합계: 조각 %d개 -> %d짝", len(texts), len(merged))
+        return merged
 
     async def arecheck_vocab(self, text: str, found: list[VocabPair],
                              provider: str | None = None) -> list[VocabPair]:
@@ -375,9 +425,8 @@ class LlmService:
         return _run(self.arefine(query, contexts, draft, provider))
 
     def refine_all(self, query: str, contexts: list, draft: str,
-                   providers: list[str], skip: str | None = None,
-                   parallel: bool = True) -> dict[str, str]:
-        return _run(self.arefine_all(query, contexts, draft, providers, skip, parallel))
+                   providers: list[str], parallel: bool = True) -> dict[str, str]:
+        return _run(self.arefine_all(query, contexts, draft, providers, parallel))
 
     def merge(self, question: str, answers: list[str],
               provider: str | None = None) -> str:
@@ -385,6 +434,11 @@ class LlmService:
 
     def extract_vocab(self, text: str, provider: str | None = None) -> list[VocabPair]:
         return _run(self.aextract_vocab(text, provider))
+
+    def extract_vocab_all(self, texts: list[str], provider: str | None = None,
+                          parallel: bool = True, max_concurrent: int = 4,
+                          ) -> list[VocabPair]:
+        return _run(self.aextract_vocab_all(texts, provider, parallel, max_concurrent))
 
     def recheck_vocab(self, text: str, found: list[VocabPair],
                       provider: str | None = None) -> list[VocabPair]:

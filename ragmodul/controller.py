@@ -20,8 +20,8 @@ from .service.chunker_service import chunk
 from .service.db_service import DbService
 from .service.embedded_service import EmbeddedService
 from .service.parser_service import parse
-from .service.reranker_service import RerankerService
-from .util import expand_query, filter_vocab_pairs
+from .service.reranker_service import DEFAULT_MAX_PER_PARENT, RerankerService
+from .util import DEFAULT_PACK_CHARS, expand_query, filter_vocab_pairs, pack_texts
 
 logger = logging.getLogger(__name__)
 
@@ -120,19 +120,18 @@ class RagController:
     def embed_bge_m3(self, document: ChunkedDocument) -> ChunkedDocument:
         """각 child에 dense 벡터와 sparse 가중치를 채워 넣는다. 같은 객체를 돌려준다.
 
-        embedded 라이브러리가 dense/sparse 를 한 번에 주는 메서드를 열어두지 않아
-        forward 가 두 번 돈다. 합치려면 그쪽에 encode_all() 을 추가해야 한다.
+        한 번의 forward 로 둘 다 받는다. 예전에는 encode_documents 와 encode_sparse 를
+        따로 불러서 같은 텍스트를 두 번 토크나이징하고 두 번 추론했다 —
+        실측(child 374개): 530.0초 -> 265.0초. 결과는 완전히 같다.
         """
         children = document.children()
-        texts = [c.content for c in children]
+        result = self._embedder.encode_dense_sparse([c.content for c in children])
 
-        vectors = self._embedder.encode_documents(texts)
-        weights = self._embedder.encode_sparse(texts)
-        for child, vector, weight in zip(children, vectors, weights):
+        for child, vector, weight in zip(children, result.dense, result.sparse):
             child.vector = vector
             child.sparse = weight
 
-        logger.info("임베딩 완료: %d개 (dense+sparse)", len(children))
+        logger.info("임베딩 완료: %d개 (dense+sparse, forward 1회)", len(children))
         return document
 
     def save_to_vector_db(self, document: ChunkedDocument) -> int:
@@ -146,8 +145,15 @@ class RagController:
     def embed_query(self, query: str, vocab: dict[str, list[str]] | None = None):
         """질의를 (dense 벡터, sparse 가중치) 로 만든다.
 
-        검색이 둘 다 쓰므로 함께 돌려준다. 질의는 한 문장이라 두 번 호출해도
-        비용이 거의 없다(문서 임베딩과 달리).
+        검색이 둘 다 쓰므로 함께 돌려준다.
+
+        embed_bge_m3 는 encode_dense_sparse 로 forward 를 한 번만 돌리는데 여기는
+        일부러 두 번 부른다. encode_queries 가 모델별 쿼리 접두사를 붙이고
+        encode_dense_sparse 는 안 붙이기 때문이다(그쪽은 bge-m3 전용으로 만들어졌다).
+        bge-m3 는 접두사가 빈 문자열이라 지금은 결과가 같지만, 접두사를 쓰는 모델로
+        바꾸면 질의만 접두사가 빠져 문서 벡터와 다른 규칙으로 만들어진다 — 에러 없이
+        검색 품질만 떨어지는, 찾기 어려운 종류의 문제다.
+        질의는 한 문장이라 두 번 돌아도 수십 ms 다(374개 배치와 다르다).
 
         vocab 을 주면(load_vocab() 결과) 축약어의 짝을 질의에 덧붙여서 임베딩한다.
         dense·sparse 양쪽에 같은 확장 질의를 쓴다 — 실측에서 둘 다 좋아졌고 나빠진
@@ -191,9 +197,17 @@ class RagController:
                     len(hits), len(contexts), merged, len(contexts) - merged)
         return contexts[:limit] if limit else contexts
 
-    def rerank(self, query: str, contexts: list, top_k: int = 3) -> list:
-        logger.info("리랭크: %d개 -> top_k=%d", len(contexts), top_k)
-        return self._reranker.rerank(query, contexts, top_k)
+    def rerank(self, query: str, contexts: list, top_k: int = 3,
+               max_per_parent: int | None = DEFAULT_MAX_PER_PARENT) -> list:
+        """맥락을 재정렬해 상위 top_k 를 돌려준다.
+
+        max_per_parent 는 한 부모의 조각을 최종 자리에 몇 개까지 담을지다. 점수는
+        전부 계산하고 고를 때만 제한한다 — 리랭크 전에 자르면 정답이 사라진다(실측).
+        None 이면 제한하지 않는다.
+        """
+        logger.info("리랭크: %d개 -> top_k=%d (부모당 최대 %s)",
+                    len(contexts), top_k, max_per_parent or "제한없음")
+        return self._reranker.rerank(query, contexts, top_k, max_per_parent)
 
     #------------------------------------------------┌> 답변 생성 (선택 의존성)
 
@@ -224,8 +238,7 @@ class RagController:
                                                  provider=provider)
 
     def refine_all(self, query: str, contexts: list, draft: str,
-                   providers: list[str], skip: str | None = None,
-                   parallel: bool = True) -> dict[str, str]:
+                   providers: list[str], parallel: bool = True) -> dict[str, str]:
         """고른 모델들이 같은 초안을 각자 다듬는다. {provider: 다듬은 답변}.
 
         사용자가 한 질의에 모델을 여러 개 골랐을 때 쓰는 단계다. 목록 길이만큼
@@ -236,18 +249,16 @@ class RagController:
 
         하나가 죽어도 나머지는 돌려준다. 실패한 provider 는 결과에 없으니 providers 와
         대조하면 무엇이 빠졌는지 알 수 있다.
-
-        skip 에 초안을 만든 provider 를 주면 건너뛴다.
         """
         return self._require_llm().refine_all(query, contexts, draft, providers,
-                                              skip, parallel)
+                                              parallel)
 
     async def arefine_all(self, query: str, contexts: list, draft: str,
-                          providers: list[str], skip: str | None = None,
-                          parallel: bool = True) -> dict[str, str]:
+                          providers: list[str], parallel: bool = True,
+                          ) -> dict[str, str]:
         """refine_all() 의 async 판."""
         return await self._require_llm().arefine_all(query, contexts, draft,
-                                                     providers, skip, parallel)
+                                                     providers, parallel)
 
     def merge(self, question: str, answers: list[str],
               provider: str | None = None) -> str:
@@ -282,6 +293,37 @@ class RagController:
         provider 를 쓰거나, 로컬로 하려면 글을 잘라서 여러 번 불러야 한다.
         """
         return self._require_llm().extract_vocab(text, provider=provider)
+
+    def pack_texts(self, texts: list[str], max_chars: int = DEFAULT_PACK_CHARS,
+                   ) -> list[str]:
+        """글 조각을 순서대로 이어 붙여 max_chars 이하 묶음들로 만든다. 순수 계산.
+
+        컨텍스트가 좁은 모델(로컬)에 문서를 나눠 보낼 때 extract_vocab_all 앞에 쓴다.
+        부모(헤딩) 단위 조각을 넘기면 조각 경계에서만 끊는다 — 자르거나 버리지 않고,
+        넘칠 조각은 다음 묶음의 첫 조각이 된다.
+        """
+        return pack_texts(texts, max_chars)
+
+    def extract_vocab_all(self, texts: list[str], provider: str | None = None,
+                          parallel: bool = True, max_concurrent: int = 4,
+                          ) -> list[VocabPair]:
+        """조각마다 축약어를 뽑아 합친다. 같은 짝은 한 번만 남긴다.
+
+        컨텍스트가 좁아 문서를 통째로 못 보내는 모델(로컬)에 쓴다. 조각은 pack_texts
+        로 만든다. 조각 하나가 실패해도 나머지는 살린다.
+
+        정확도는 통째로 한 번 보내는 것보다 낮다 — 조각 경계에서 앞의 정의와 뒤의
+        사용이 갈라진다. 대신 한도(429)에 걸리지 않고 비용이 0이다.
+        """
+        return self._require_llm().extract_vocab_all(texts, provider, parallel,
+                                                     max_concurrent)
+
+    async def aextract_vocab_all(self, texts: list[str], provider: str | None = None,
+                                 parallel: bool = True, max_concurrent: int = 4,
+                                 ) -> list[VocabPair]:
+        """extract_vocab_all() 의 async 판."""
+        return await self._require_llm().aextract_vocab_all(texts, provider, parallel,
+                                                           max_concurrent)
 
     def recheck_vocab(self, text: str, found: list[VocabPair],
                       provider: str | None = None) -> list[VocabPair]:

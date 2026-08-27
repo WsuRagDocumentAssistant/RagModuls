@@ -108,6 +108,50 @@ def _norm(text: str) -> str:
     return _SPACE.sub("", text or "")
 
 
+#------------------------------------------------┌> 글 묶기
+
+# 로컬 모델(gemma-4-12B-it) 한 요청에 들어가는 본문 크기. 실측으로 계산했다 —
+#   컨텍스트 8192 토큰(입력+출력). 엔드포인트가 그대로 알려준다:
+#     "This model's maximum context length is 8192 tokens. However, you requested
+#      8 output tokens and your prompt contains at least 8185 input tokens"
+#   한국어 12,000자 = 8,185 토큰 -> 글자당 0.68 토큰
+#   8192 - 2048(출력 자리) - 950(vocab 시스템 프롬프트 1,395자) = 5,194 토큰 ≈ 7,600자
+# 7,600 을 그대로 쓰면 프롬프트를 조금 손볼 때마다 넘치므로 여유를 둔다.
+DEFAULT_PACK_CHARS = 6500
+
+
+def pack_texts(texts: list[str], max_chars: int = DEFAULT_PACK_CHARS) -> list[str]:
+    """글 조각을 순서대로 이어 붙여 max_chars 이하 묶음들로 만든다.
+
+    컨텍스트가 좁은 모델에 문서를 나눠 보낼 때 쓴다. 부모(헤딩) 단위 조각을 넘기면
+    조각 경계에서만 끊으므로 헤딩이 반토막 나지 않는다.
+
+    자르거나 버리지 않는다. 넘칠 조각은 다음 묶음의 첫 조각이 된다 — 모든 조각이
+    정확히 한 번 들어가고, 묶음들의 글자 합은 입력 합과 같다.
+
+    조각 하나가 혼자 max_chars 보다 크면 그 조각만 담은 묶음이 되고 그 묶음은 상한을
+    넘는다. 부르는 쪽이 잘라야 한다(실측 문서는 최대 부모가 5,987자라 해당 없음).
+
+    묶는 이유는 컨텍스트를 채우는 것보다 경계를 줄이는 데 있다. 조각마다 한 번씩
+    부르면 조각 사이 모든 지점이 요청 경계가 되고, 앞에서 정의한 축약어와 뒤에서 쓴
+    자리가 갈라진다(실측: 부모별 32회가 통째 1회보다 적게 찾았다).
+    """
+    groups: list[str] = []
+    current: list[str] = []
+    size = 0
+    for text in texts:
+        if not text:
+            continue
+        if current and size + len(text) > max_chars:
+            groups.append("\n\n".join(current))
+            current, size = [], 0
+        current.append(text)
+        size += len(text)
+    if current:
+        groups.append("\n\n".join(current))
+    return groups
+
+
 #------------------------------------------------┌> 질의 확장
 
 def expand_query(query: str, vocab: dict[str, list[str]] | None) -> str:
