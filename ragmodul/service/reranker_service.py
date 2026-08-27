@@ -39,10 +39,19 @@ class RerankerService:
 
         self.batch_size = batch_size
 
+        # device=None 을 sentence-transformers 에 그대로 넘기면 GPU 가 있어도 CPU 로
+        # 떨어진다("No device provided, using cpu"). 자동 감지를 해주지 않는다.
+        # 임베더 쪽은 알아서 GPU 를 잡으므로, 안 맞춰주면 한쪽만 CPU 로 도는 상태가
+        # 조용히 만들어진다(실측: RagSystem 워커에서 리랭커만 device=cpu).
+        if device is None:
+            import torch
+
+            device = "cuda" if torch.cuda.is_available() else "cpu"
+
         self._model = CrossEncoder(
             model_path,
             max_length=max_length,
-            device=device,              # None 이면 자동 감지
+            device=device,
             local_files_only=True,      # 로컬 폴더만 본다 (401 방지)
         )
 

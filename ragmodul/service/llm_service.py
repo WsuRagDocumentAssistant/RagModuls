@@ -167,22 +167,29 @@ class LlmService:
                     provider or self.default, len(contexts), len(block), len(text))
         return text
 
-    async def amerge(self, question: str, answer_a: str, answer_b: str,
+    async def amerge(self, question: str, answers: list[str],
                      provider: str | None = None) -> str:
-        """LLM 두 개가 낸 답변을 하나로 합친다.
+        """여러 LLM 이 낸 답변을 하나로 합친다. 개수 제한은 없다.
 
         어느 provider 로 병합할지는 부르는 쪽이 정한다 — 답변을 낸 것과 달라도 된다.
-        두 개까지만 받는다. 프롬프트가 '두 AI' 를 전제로 쓰여 있다.
-        """
-        if not answer_a or not answer_b:
-            logger.warning("병합할 답변이 하나뿐이다. 그대로 돌려준다.")
-            return answer_a or answer_b or ""
+        판단 작업이라 더 센 모델을 쓰고 싶을 수 있다.
 
-        system, user = get_prompt("merge", question=question,
-                                  answer_a=answer_a, answer_b=answer_b)
+        셋 이상도 한 번에 넘긴다. 둘씩 접어 올리면(merge(A,B) 뒤에 merge(AB,C))
+        호출이 늘 뿐 아니라, C 가 '이미 합쳐진 것' 과 1:1 로 겨루게 되어 A·B 의 근거가
+        묽어진다. 프롬프트의 '더 근거가 명확한 쪽을 따르라' 는 전부 나란히 놓고 봐야
+        성립한다.
+        """
+        answers = [a for a in answers if a and a.strip()]
+        if len(answers) < 2:
+            logger.warning("병합할 답변이 %d개다. 그대로 돌려준다.", len(answers))
+            return answers[0] if answers else ""
+
+        blocks = "\n\n".join(f"<답변{i}>\n{a}\n</답변{i}>"
+                             for i, a in enumerate(answers, 1))
+        system, user = get_prompt("merge", question=question, answers=blocks)
         text = await self.aask(user, provider, system=system)
-        logger.info("[%s] 병합: %d자 + %d자 -> %d자",
-                    provider or self.default, len(answer_a), len(answer_b), len(text))
+        logger.info("[%s] 병합: %s -> %d자", provider or self.default,
+                    " + ".join(f"{len(a):,}자" for a in answers), len(text))
         return text
 
     #------------------------------------------------┌> 축약어 사전 (async 본체)
@@ -291,9 +298,9 @@ class LlmService:
     def answer(self, query: str, contexts: list, provider: str | None = None) -> str:
         return _run(self.aanswer(query, contexts, provider))
 
-    def merge(self, question: str, answer_a: str, answer_b: str,
+    def merge(self, question: str, answers: list[str],
               provider: str | None = None) -> str:
-        return _run(self.amerge(question, answer_a, answer_b, provider))
+        return _run(self.amerge(question, answers, provider))
 
     def extract_vocab(self, text: str, provider: str | None = None) -> list[VocabPair]:
         return _run(self.aextract_vocab(text, provider))

@@ -205,6 +205,26 @@ class RagController:
         """answer() 의 async 판. 이미 이벤트 루프 안이면 이쪽을 await 한다."""
         return await self._require_llm().aanswer(query, contexts, provider=provider)
 
+    def merge(self, question: str, answers: list[str],
+              provider: str | None = None) -> str:
+        """여러 모델의 답변을 하나로 합친다. LLM 한 번.
+
+        사용자가 provider 를 둘 이상 골랐을 때 쓴다. 개수 제한은 없다 — 셋이면 셋을
+        한 번에 넘긴다. 병합에 쓸 모델은 답변을 낸 것과 달라도 된다.
+
+        답변이 하나뿐이면 그대로 돌려준다(호출하지 않는다).
+
+        병합 모델은 Context 를 못 본다(질문과 답변들이 전부다). 그래서 수치가
+        원데이터인지 계산값인지 다시 판단하지 않고, 입력이 매겨둔 구분을 그대로
+        옮기도록 프롬프트가 지시한다.
+        """
+        return self._require_llm().merge(question, answers, provider=provider)
+
+    async def amerge(self, question: str, answers: list[str],
+                     provider: str | None = None) -> str:
+        """merge() 의 async 판."""
+        return await self._require_llm().amerge(question, answers, provider=provider)
+
     #------------------------------------------------┌> 축약어 사전
 
     def extract_vocab(self, text: str, provider: str | None = None) -> list[VocabPair]:
