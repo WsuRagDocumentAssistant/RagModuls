@@ -167,6 +167,78 @@ class LlmService:
                     provider or self.default, len(contexts), len(block), len(text))
         return text
 
+    async def arefine(self, query: str, contexts: list, draft: str,
+                      provider: str | None = None) -> str:
+        """다른 모델이 만든 답변 초안을 Context 와 견주어 고친다.
+
+        local_llm 이 초안을 만들고 사용자가 고른 모델이 다듬는 흐름에 쓴다.
+
+        Context 를 함께 넘긴다 — 초안만 주면 사실이 맞는지 볼 수 없고, 수치가
+        원데이터인지 계산값인지도 다시 매길 수 없다. 대신 클라우드로 나가는 입력이
+        직접 답할 때와 비슷해진다(맥락 + 초안). 토큰을 아끼려면 초안만 넘기는 별도
+        경로가 필요한데, 그때는 초안의 오류를 그대로 물려받는다.
+
+        초안이 비어 있으면 호출하지 않는다 — 다듬을 게 없다.
+        """
+        if not draft or not draft.strip():
+            logger.warning("초안이 비어 있다. 다듬기를 건너뛴다.")
+            return ""
+
+        block = _format_contexts(contexts)
+        system, user = get_prompt("refine", context=block, query=query, draft=draft)
+        text = await self.aask(user, provider, system=system)
+        logger.info("[%s] 다듬기: 초안 %d자 + 맥락 %d자 -> %d자",
+                    provider or self.default, len(draft), len(block), len(text))
+        return text
+
+    async def arefine_all(self, query: str, contexts: list, draft: str,
+                          providers: list[str], skip: str | None = None,
+                          parallel: bool = True) -> dict[str, str]:
+        """고른 모델들이 같은 초안을 각자 다듬는다. {provider: 다듬은 답변}.
+
+        하나가 죽어도 나머지는 돌려준다 — 한도(429)나 키 없음으로 한쪽만 실패하는 게
+        흔하다. 실패한 provider 는 결과에 없으므로, 부르는 쪽이 providers 와 대조하면
+        무엇이 빠졌는지 알 수 있다.
+
+        skip 에 초안을 만든 provider 를 주면 건너뛴다. 자기 초안을 자기가 다듬을
+        이유가 없다. 같은 provider 가 두 번 들어오면 한 번만 부른다.
+
+        parallel=True 면 동시에 던진다. LLM 호출은 전부 네트워크 대기라 GIL 이 걸림돌이
+        아니다 — 기다리는 동안 GIL 을 놓으므로 단일 스레드에서도 실제로 겹친다. 걸리는
+        시간이 합이 아니라 가장 느린 하나가 된다.
+
+        parallel=False 는 분당 토큰 한도에 걸릴 때 쓴다. 큰 맥락이 붙은 요청 여러 개가
+        같은 순간에 나가면 429 가 나는데(실측), 순차면 요청이 끝나야 다음이 나가 자연히
+        벌어진다.
+        """
+        # 중복을 지우면서 순서는 유지한다 — 결과 dict 의 순서가 요청 순서와 맞는다
+        targets = list(dict.fromkeys(p for p in providers if p and p != skip))
+        if not targets:
+            return {}
+
+        if parallel:
+            # return_exceptions 를 안 켜면 하나가 터질 때 나머지가 취소되고 예외만 올라온다
+            results = await asyncio.gather(
+                *(self.arefine(query, contexts, draft, name) for name in targets),
+                return_exceptions=True,
+            )
+        else:
+            results = []
+            for name in targets:
+                try:
+                    results.append(await self.arefine(query, contexts, draft, name))
+                except Exception as e:
+                    results.append(e)
+
+        refined: dict[str, str] = {}
+        for name, result in zip(targets, results):
+            if isinstance(result, BaseException):
+                logger.warning("[%s] 다듬기 실패: %s - %s",
+                               name, type(result).__name__, result)
+            else:
+                refined[name] = result
+        return refined
+
     async def amerge(self, question: str, answers: list[str],
                      provider: str | None = None) -> str:
         """여러 LLM 이 낸 답변을 하나로 합친다. 개수 제한은 없다.
@@ -297,6 +369,15 @@ class LlmService:
 
     def answer(self, query: str, contexts: list, provider: str | None = None) -> str:
         return _run(self.aanswer(query, contexts, provider))
+
+    def refine(self, query: str, contexts: list, draft: str,
+               provider: str | None = None) -> str:
+        return _run(self.arefine(query, contexts, draft, provider))
+
+    def refine_all(self, query: str, contexts: list, draft: str,
+                   providers: list[str], skip: str | None = None,
+                   parallel: bool = True) -> dict[str, str]:
+        return _run(self.arefine_all(query, contexts, draft, providers, skip, parallel))
 
     def merge(self, question: str, answers: list[str],
               provider: str | None = None) -> str:

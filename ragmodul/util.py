@@ -20,10 +20,14 @@ _SPACE = re.compile(r"\s+")
 # 영문·숫자로 시작하는 표기. 이런 건 단어 경계로 찾는다.
 _ASCII_KEY = re.compile(r"^[A-Za-z0-9][A-Za-z0-9.+\-]*$")
 
-# 풀어쓴 말은 이름이라 짧고 설명은 길다. 실측 —
-#   정상 최대 49자 'Common European Framework of Reference of Language'
+# 확장어 길이 상한. 문단을 통째로 확장어에 넣는 사고만 막는 역할이다.
+#
+# 한때 60자였다. 표본 하나로 그은 선이었다 —
+#   정상 최대 50자 'Common European Framework of Reference of Language'
 #   설명      62자 'Alpha(2개월)-Beta(4개월, 학기)-Gold(1년)의 ... 환류체계'
-DEFAULT_MAX_EXPANSION = 60
+# 둘의 간격이 12자뿐이라 조금만 긴 정식 명칭도 잘렸다. 영문 기관명은 이보다 긴 게
+# 흔하다. 설명문은 콜론 규칙과 프롬프트가 이미 잡는다(gpt 17개 중 설명문 0개).
+DEFAULT_MAX_EXPANSION = 80
 
 
 def filter_vocab_pairs(pairs: list[VocabPair], skip: set[str] | None = None,
@@ -31,13 +35,18 @@ def filter_vocab_pairs(pairs: list[VocabPair], skip: set[str] | None = None,
                        ) -> tuple[list[VocabPair], list[tuple[VocabPair, str]]]:
     """LLM 이 뽑은 축약어 짝에서 못 쓸 것을 걸러낸다. (통과, [(버린 짝, 이유)])
 
-    목적은 완벽한 선별이 아니라 사람이 검수할 양을 줄이는 것이다. 실측(문서 하나,
-    로컬 모델 temperature=0, 재현 확인) — 45개 중 20개를 버렸다.
+    지금은 gpt 로 뽑으면 한 건도 안 버린다(11개 중 0개, 17개 중 0개). 남겨두는 이유는
+    둘이다 — 중복 제거(recheck_vocab 을 켜면 1차·2차 결과를 이어 붙인다. 2차가 '이미
+    있는 건 내지 마라'를 늘 지키지는 않는다)와, 모델·프롬프트를 바꿀 때의 안전망이다.
+    순수 계산이라 비용이 없고, dropped 목록이 뭔가 이상해졌다는 신호가 된다.
+
+    선별이 실제로 필요했던 때의 실측(문서 하나, 로컬 모델 temperature=0, 재현 확인) —
+    45개 중 20개를 버렸다.
 
         term == expansion            6   '단기 -> 단기', '중장기 -> 중장기'
         콜론                          5   'SMART -> Attributable: 달성가능성'
         term 한 글자                   4   'A -> 평가 결과 반영 개선안 마련'  (표의 열 이름)
-        skip 목록                     3   AI / DS / XR
+        skip 목록                     3   AI / DS / XR  (지금은 목록을 비워둔다)
         expansion 이 term 을 괄호로 품음  1   '7-Core -> 핵심역량(7-Core)'
         길이 초과                      1   'Agile -> Alpha(2개월)-Beta(...'
 

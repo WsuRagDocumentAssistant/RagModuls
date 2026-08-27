@@ -205,6 +205,50 @@ class RagController:
         """answer() 의 async 판. 이미 이벤트 루프 안이면 이쪽을 await 한다."""
         return await self._require_llm().aanswer(query, contexts, provider=provider)
 
+    def refine(self, query: str, contexts: list, draft: str,
+               provider: str | None = None) -> str:
+        """다른 모델이 만든 답변 초안을 다듬는다. LLM 한 번.
+
+        local_llm 이 초안을 만들고 사용자가 고른 모델이 다듬는 단계다. 고른 모델이
+        여럿이면 각자 같은 초안을 받아 따로 다듬는다 — 서로 이어 붙이지 않는다.
+        순차로 넘기면 앞 모델의 판단이 뒤로 갈수록 굳어진다.
+
+        Context 를 함께 넘긴다. 사실 검증과 수치 서식 판단에 필요하다.
+        """
+        return self._require_llm().refine(query, contexts, draft, provider=provider)
+
+    async def arefine(self, query: str, contexts: list, draft: str,
+                      provider: str | None = None) -> str:
+        """refine() 의 async 판."""
+        return await self._require_llm().arefine(query, contexts, draft,
+                                                 provider=provider)
+
+    def refine_all(self, query: str, contexts: list, draft: str,
+                   providers: list[str], skip: str | None = None,
+                   parallel: bool = True) -> dict[str, str]:
+        """고른 모델들이 같은 초안을 각자 다듬는다. {provider: 다듬은 답변}.
+
+        사용자가 한 질의에 모델을 여러 개 골랐을 때 쓰는 단계다. 목록 길이만큼
+        호출한다 — 하나면 1번, 셋이면 3번.
+
+        기본은 동시 호출이라 걸리는 시간이 합이 아니라 가장 느린 하나다. 분당 토큰
+        한도에 걸리면 parallel=False 로 순차로 돌린다.
+
+        하나가 죽어도 나머지는 돌려준다. 실패한 provider 는 결과에 없으니 providers 와
+        대조하면 무엇이 빠졌는지 알 수 있다.
+
+        skip 에 초안을 만든 provider 를 주면 건너뛴다.
+        """
+        return self._require_llm().refine_all(query, contexts, draft, providers,
+                                              skip, parallel)
+
+    async def arefine_all(self, query: str, contexts: list, draft: str,
+                          providers: list[str], skip: str | None = None,
+                          parallel: bool = True) -> dict[str, str]:
+        """refine_all() 의 async 판."""
+        return await self._require_llm().arefine_all(query, contexts, draft,
+                                                     providers, skip, parallel)
+
     def merge(self, question: str, answers: list[str],
               provider: str | None = None) -> str:
         """여러 모델의 답변을 하나로 합친다. LLM 한 번.
