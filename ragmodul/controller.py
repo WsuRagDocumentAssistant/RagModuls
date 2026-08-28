@@ -66,7 +66,7 @@ class RagController:
         self.reranker_max_length = reranker_max_length
         self.unpack_dir = unpack_dir
         self.image_dir = image_dir
-        self.db_config = db_config
+        #self.db_config = db_config
         self.llm_api_config = llm_api_config
         self.local_llm_config = local_llm_config
         self.llm_default = llm_default
@@ -134,11 +134,11 @@ class RagController:
         logger.info("임베딩 완료: %d개 (dense+sparse, forward 1회)", len(children))
         return document
 
-    # def save_to_vector_db(self, document: ChunkedDocument) -> int:
-    #     """저장하고 저장한 child 수를 돌려준다."""
-    #     self._db.save_document(document)
-    #     logger.info("DB 저장 완료: %d개", len(document.children()))
-    #     return len(document.children())
+    def save_to_vector_db(self, document: ChunkedDocument) -> int:
+        """저장하고 저장한 child 수를 돌려준다."""
+        self._db.save_document(document)
+        logger.info("DB 저장 완료: %d개", len(document.children()))
+        return len(document.children())
 
     #------------------------------------------------┌> 질의 검색
 
@@ -170,13 +170,13 @@ class RagController:
         weights = self._embedder.encode_sparse([text])[0]
         return vector, weights
 
-    # def hybrid_search(self, query_vector, query_weights=None, top_k: int = 5) -> list:
-    #     """dense + sparse 를 RRF 로 합쳐 검색한다.
+    def hybrid_search(self, query_vector, query_weights=None, top_k: int = 5) -> list:
+        """dense + sparse 를 RRF 로 합쳐 검색한다.
 
-    #     query_weights 가 없으면 dense 단독으로 떨어진다.
-    #     """
-    #     logger.info("검색: top_k=%d (%s)", top_k, "hybrid" if query_weights else "dense")
-    #     return self._db.search_hybrid(query_vector, query_weights, top_k)
+        query_weights 가 없으면 dense 단독으로 떨어진다.
+        """
+        logger.info("검색: top_k=%d (%s)", top_k, "hybrid" if query_weights else "dense")
+        return self._db.search_hybrid(query_vector, query_weights, top_k)
 
     def build_contexts(self, hits: list, merge_ratio: float = DEFAULT_MERGE_RATIO,
                        limit: int | None = None) -> list[RetrievedContext]:
@@ -342,16 +342,16 @@ class RagController:
         """
         return filter_vocab_pairs(pairs, skip)
 
-    # def save_vocab(self, pairs: list[VocabPair]) -> int:
-    #     """검수한 짝을 DB 에 넣고 새로 들어간 확장어 수를 돌려준다.
+    def save_vocab(self, pairs: list[VocabPair]) -> int:
+        """검수한 짝을 DB 에 넣고 새로 들어간 확장어 수를 돌려준다.
 
-    #     같은 것을 또 넣어도 늘지 않는다 — 재실행해도 사전이 부풀지 않는다.
-    #     """
-    #     return self._db.save_vocab(pairs)
+        같은 것을 또 넣어도 늘지 않는다 — 재실행해도 사전이 부풀지 않는다.
+        """
+        return self._db.save_vocab(pairs)
 
-    # def load_vocab(self) -> dict[str, list[str]]:
-    #     """{축약어: [확장어, ...]}. 질의 확장이 이 형태로 쓴다."""
-    #     return self._db.load_vocab()
+    def load_vocab(self) -> dict[str, list[str]]:
+        """{축약어: [확장어, ...]}. 질의 확장이 이 형태로 쓴다."""
+        return self._db.load_vocab()
 
     #------------------------------------------------┌> 내부
 

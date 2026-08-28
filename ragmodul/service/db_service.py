@@ -1,6 +1,3 @@
-#================================================
-# db_service.py
-#================================================
 """
 DB 저장/검색 단계 — PostgreSQL + pgvector.
 
@@ -22,10 +19,6 @@ from psycopg.rows import dict_row
 
 logger = logging.getLogger(__name__)
 
-# 로컬 개발용 접속 기본값. 애플리케이션이 config 인자로 항목을 덮어쓸 수 있다
-# (main.py 의 build_db_config 가 .env 를 읽어 넘긴다). 넘긴 항목만 덮어쓰므로
-# 비밀번호 하나만 줘도 나머지는 아래 값이 남는다.
-
 
 # sparse 차원은 임베딩 모델의 vocab 크기다. 모델이 EmbeddedService.sparse_dimension
 # 으로 알려주므로 컨트롤러가 그 값을 넘긴다. 아래는 모델 없이 DbService 만 쓸 때의
@@ -36,9 +29,7 @@ DEFAULT_SPARSE_DIM = 250002
 class DbService:
 
     def __init__(self, config: dict | None = None, sparse_dim: int = DEFAULT_SPARSE_DIM) -> None:
-        # 통째로 갈아끼우지 않고 덮어쓴다. 바꾸고 싶은 항목만 넘기면 되고,
-        # client_encoding 처럼 매번 적기 번거로운 값은 기본값이 남는다.
-        self.config = { **(config or {})}
+        self.config = dict(config or DB_CONFIG)
         self.sparse_dim = sparse_dim
         self._conn: psycopg.Connection | None = None
         self.load()
@@ -65,7 +56,7 @@ class DbService:
             self._conn.close()
             self._conn = None
 
-    #------------------------------------------------┌> 저장
+    # ── 저장 ────────────────────────────────────────────────────────────
 
     def save_document(self, document) -> int:
         """ChunkedDocument 를 통째로 저장하고 document.id 를 돌려준다.
@@ -141,7 +132,7 @@ class DbService:
                     document_id, len(document.parents), len(child_rows))
         return document_id
 
-    #------------------------------------------------┌> 검색
+    # ── 검색 ────────────────────────────────────────────────────────────
 
     def search(self, query_vector, top_k: int = 5, document_id: int | None = None) -> list[dict]:
         """dense 검색. child 로 찾고 parent 를 붙여 돌려준다.
@@ -267,18 +258,11 @@ class DbService:
                     d.title         AS document_title,
                     dense.similarity  AS dense_score,
                     sparse.similarity AS sparse_score,
-                    -- 이 부모가 가진 전체 조각 수. 승격 비율의 분모다(검색 결과에는
-                    -- '걸린' 조각만 있어서 전체를 알 수 없다). 최종 몇 행에만 돌고
-                    -- idx_child_parent 를 타므로 부담이 없다.
-                    (SELECT count(*) FROM child_chunk x WHERE x.parent_id = c.parent_id)
-                                      AS parent_child_count,
                     COALESCE(1.0 / (%s + dense.rank),  0)
                   + COALESCE(1.0 / (%s + sparse.rank), 0) AS similarity
-                -- FULL OUTER: 한쪽에서만 잡힌 청크도 남긴다. 그쪽 rank 는 NULL 이 되고
-                -- COALESCE 가 그 항을 0 으로 처리한다.
                 FROM dense
-                FULL OUTER JOIN sparse ON sparse.id = dense.id
-                JOIN child_chunk  c ON c.id = COALESCE(dense.id, sparse.id)
+                FULL OUTER JOIN sparse USING (id)
+                JOIN child_chunk  c ON c.id = id
                 JOIN parent_chunk p ON p.id = c.parent_id
                 JOIN document     d ON d.id = c.document_id
                 ORDER BY similarity DESC
@@ -290,69 +274,7 @@ class DbService:
             )
             return cur.fetchall()
 
-    #------------------------------------------------┌> 축약어 사전
-
-    def save_vocab(self, pairs) -> int:
-        """축약어/확장어 짝을 넣고 새로 들어간 확장어 수를 돌려준다.
-
-        pairs 는 납작한 VocabPair 목록이라 같은 축약어가 여러 번 올 수 있다
-        (실측: 축약어 12 개에 확장어 14 개 — IR 과 PAMS 가 둘씩이다). 먼저 축약어로
-        묶어서 vocab_short 를 축약어당 한 번만 건드린다.
-
-        이미 있는 축약어는 그 id 를 재사용한다. 새 행을 만들면 확장어가 두 id 로
-        흩어져 조회에서 절반만 나온다.
-        """
-        by_term: dict[str, list[str]] = {}
-        for pair in pairs:
-            expansions = by_term.setdefault(pair.term, [])
-            if pair.expansion not in expansions:        # 호출 안 중복 제거
-                expansions.append(pair.expansion)
-
-        added = 0
-        with self._conn.cursor() as cur:
-            for term, expansions in by_term.items():
-                # DO NOTHING 이면 RETURNING 이 아무것도 안 주므로 id 는 따로 읽는다.
-                # 사전이 십여 개라 왕복이 늘어도 상관없고, 이쪽이 읽기 쉽다.
-                cur.execute(
-                    "INSERT INTO vocab_short (term) VALUES (%s) ON CONFLICT (term) DO NOTHING;",
-                    (term,),
-                )
-                cur.execute("SELECT id FROM vocab_short WHERE term = %s;", (term,))
-                short_id = cur.fetchone()["id"]
-
-                for expansion in expansions:
-                    cur.execute(
-                        """
-                        INSERT INTO vocab_expansion (short_id, term) VALUES (%s, %s)
-                        ON CONFLICT (short_id, term) DO NOTHING;
-                        """,
-                        (short_id, expansion),
-                    )
-                    added += cur.rowcount               # 건너뛰면 0 이다
-        self._conn.commit()
-        logger.info("사전 저장: 축약어 %d개, 확장어 %d개 추가", len(by_term), added)
-        return added
-
-    def load_vocab(self) -> dict[str, list[str]]:
-        """{축약어: [확장어, ...]} 를 통째로 읽는다.
-
-        질의마다 DB 를 치지 않고 한 번 올려두고 쓴다 — 사전이 십여 개다.
-        """
-        with self._conn.cursor() as cur:
-            cur.execute(
-                """
-                SELECT s.term AS short, e.term AS expansion
-                FROM vocab_short s
-                JOIN vocab_expansion e ON e.short_id = s.id
-                ORDER BY s.term, e.term;
-                """
-            )
-            vocab: dict[str, list[str]] = {}
-            for row in cur.fetchall():
-                vocab.setdefault(row["short"], []).append(row["expansion"])
-            return vocab
-
-    #------------------------------------------------┌> 조회 도우미
+    # ── 조회 도우미 ──────────────────────────────────────────────────────
 
     def count(self) -> dict:
         """저장 결과를 눈으로 확인할 때 쓴다."""

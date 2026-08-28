@@ -214,8 +214,10 @@ class LlmService:
         벌어진다.
         """
         # 중복을 지우면서 순서는 유지한다 — 결과 dict 의 순서가 요청 순서와 맞는다
+        
         targets = list(dict.fromkeys(p for p in providers if p))
         if not targets:
+            print("왔나?")
             return {}
 
         if parallel:
@@ -261,7 +263,7 @@ class LlmService:
         blocks = "\n\n".join(f"<답변{i}>\n{a}\n</답변{i}>"
                              for i, a in enumerate(answers, 1))
         system, user = get_prompt("merge", question=question, answers=blocks)
-        text = await self.aask(user, provider, system=system)
+        text = await self.aask(user, provider, system=system, enable_web_search=False)
         logger.info("[%s] 병합: %s -> %d자", provider or self.default,
                     " + ".join(f"{len(a):,}자" for a in answers), len(text))
         return text
@@ -333,7 +335,9 @@ class LlmService:
         return merged
 
     async def arecheck_vocab(self, text: str, found: list[VocabPair],
-                             provider: str | None = None) -> list[VocabPair]:
+                             enable_web_search: bool,
+                             provider: str | None = None, 
+                             ) -> list[VocabPair]:
         """이미 뽑은 목록을 보여주고 빠뜨린 축약어를 다시 훑게 한다.
 
         한 번에 다 못 뽑는다. 실측 — 1차 11개, 재검토로 7개 추가(JA, K-MOOC, IPA,
@@ -343,7 +347,7 @@ class LlmService:
         """
         listing = "\n".join(f"- {p.term} -> {p.expansion}" for p in found) or "(없음)"
         system, user = get_prompt("vocab_recheck", found=listing, text=text)
-        result = await self.asend(user, VocabPairs, provider, system=system)
+        result = await self.asend(user, VocabPairs, provider, system=system, enable_web_search=enable_web_search)
         if result is None:
             logger.warning("축약어 재검토 실패")
             return []
@@ -353,10 +357,10 @@ class LlmService:
         logger.info("재검토: %d개 중 새로 %d개", len(result.pairs), len(fresh))
         return fresh
 
-    async def aextract_query_terms(self, query: str, provider: str | None = None) -> list[str]:
+    async def aextract_query_terms(self, query: str,  enable_web_search: bool,provider: str | None = None,) -> list[str]:
         """사용자 질의에 나온 축약어를 뽑는다. 이걸 vocab_short 에서 찾아 확장어를 붙인다."""
         system, user = get_prompt("query_terms", query=query)
-        result = await self.asend(user, QueryTerms, provider, system=system)
+        result = await self.asend(user, QueryTerms, provider, system=system, enable_web_search=enable_web_search)
         if result is None:
             logger.warning("질의 축약어 추출 실패: %s", query[:40])
             return []
@@ -366,7 +370,7 @@ class LlmService:
 
     async def asend(self, prompt: str, schema: type[BaseModel],
                     provider: str | None = None, system: str | None = None,
-                    retries: int = 1) -> BaseModel | None:
+                    retries: int = 1, enable_web_search: bool = False) -> BaseModel | None:
         """스키마를 강제해 받고 검증한다. 끝까지 실패하면 None.
 
         structured 면 response_format 으로 API 가 형식을 보장한다. 아니면 지시 뒤에
@@ -386,7 +390,7 @@ class LlmService:
 
         name = provider or self.default
         for attempt in range(retries + 1):
-            text = await self.aask(prompt, provider, system=system, response_format=fmt)
+            text = await self.aask(prompt, provider, system=system, response_format=fmt, enable_web_search=enable_web_search)
             parsed = _extract(schema, text)
             if parsed is not None:
                 return parsed
@@ -395,7 +399,9 @@ class LlmService:
 
     async def aask(self, prompt: str, provider: str | None = None,
                    system: str | None = None,
-                   response_format: dict | None = None) -> str:
+                   response_format: dict | None = None,
+                   enable_web_search: bool =True
+                   ) -> str:
         """채널로 보내고 평문을 받는다.
 
         response_format 에는 '알맹이' JSON Schema 만 넣는다. provider 별 봉투는
@@ -413,7 +419,8 @@ class LlmService:
             payload["temperature"] = prov.temperature
         if response_format is not None:
             payload["response_format"] = response_format
-        return await self._channel(prov).call(payload) or ""
+        return await self._channel(prov, enable_web_search).call(payload) or ""
+
 
     #------------------------------------------------┌> 동기 껍데기
 
@@ -492,7 +499,7 @@ class LlmService:
                 f"모르는 provider: {name!r} (있는 것: {', '.join(self._providers)})")
         return prov
 
-    def _channel(self, prov: _Provider):
+    def _channel(self, prov: _Provider, enable_web_search :bool):
         """채널을 처음 쓸 때 만들어 붙들고 있는다.
 
         생성자에서 다 만들지 않는 이유: 넷을 등록해도 실제로 쓰는 건 한둘일 때가 많고,
@@ -520,7 +527,7 @@ class LlmService:
             from ai_rag_comm import AIProvider, RestChannel
 
             prov.channel = RestChannel(
-                prov.llm_api_config, AIProvider(prov.name), prov.model)
+                prov.llm_api_config, AIProvider(prov.name), prov.model,enable_web_search=True)
             logger.info("[%s] RestChannel / %s", prov.name, prov.model)
         return prov.channel
 
