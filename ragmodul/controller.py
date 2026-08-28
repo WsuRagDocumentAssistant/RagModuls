@@ -315,7 +315,7 @@ class RagController:
         정확도는 통째로 한 번 보내는 것보다 낮다 — 조각 경계에서 앞의 정의와 뒤의
         사용이 갈라진다. 대신 한도(429)에 걸리지 않고 비용이 0이다.
         """
-        return self._require_llm().extract_vocab_all(texts, provider, parallel,
+        return self._require_llm().extract_vocab_all(texts, enable_web_search,provider, parallel,
                                                      max_concurrent)
 
     async def aextract_vocab_all(self, texts: list[str], provider: str | None = None,
