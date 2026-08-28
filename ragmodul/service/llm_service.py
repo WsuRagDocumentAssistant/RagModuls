@@ -270,7 +270,7 @@ class LlmService:
 
     #------------------------------------------------┌> 축약어 사전 (async 본체)
 
-    async def aextract_vocab(self, text: str, provider: str | None = None) -> list[VocabPair]:
+    async def aextract_vocab(self, text: str, enable_web_search: bool ,provider: str | None = None) -> list[VocabPair]:
         """텍스트에서 축약어 짝을 뽑는다.
 
         문서 전체를 한 덩어리로 넣는다. 부모별로 나눠 32번 부르면 표기 변형
@@ -280,13 +280,13 @@ class LlmService:
         로컬 모델은 컨텍스트가 8192 토큰이라 문서 전체(약 45k)를 못 받는다. 클라우드로.
         """
         system, user = get_prompt("vocab", text=text)
-        result = await self.asend(user, VocabPairs, provider, system=system)
+        result = await self.asend(user, VocabPairs, provider, system=system, enable_web_search=enable_web_search)
         if result is None:
             logger.warning("축약어 추출 실패: %s...", text[:40])
             return []
         return list(result.pairs)
 
-    async def aextract_vocab_all(self, texts: list[str], provider: str | None = None,
+    async def aextract_vocab_all(self, texts: list[str], enable_web_search:bool,provider: str | None = None,
                                  parallel: bool = True, max_concurrent: int = 4,
                                  ) -> list[VocabPair]:
         """여러 조각에서 각각 뽑아 합친다. 같은 짝은 한 번만 남긴다.
@@ -311,7 +311,7 @@ class LlmService:
 
         async def one(index: int, text: str):
             async with semaphore:
-                pairs = await self.aextract_vocab(text, provider)
+                pairs = await self.aextract_vocab(text, provider, enable_web_search=enable_web_search)
                 logger.info("사전 추출 %d/%d: %d자 -> %d짝",
                             index, len(texts), len(text), len(pairs))
                 return pairs
@@ -442,10 +442,10 @@ class LlmService:
     def extract_vocab(self, text: str, provider: str | None = None) -> list[VocabPair]:
         return _run(self.aextract_vocab(text, provider))
 
-    def extract_vocab_all(self, texts: list[str], provider: str | None = None,
+    def extract_vocab_all(self, texts: list[str], enable_web_search: bool = False,provider: str | None = None,
                           parallel: bool = True, max_concurrent: int = 4,
                           ) -> list[VocabPair]:
-        return _run(self.aextract_vocab_all(texts, provider, parallel, max_concurrent))
+        return _run(self.aextract_vocab_all(texts,enable_web_search, provider, parallel, max_concurrent))
 
     def recheck_vocab(self, text: str, found: list[VocabPair],
                       provider: str | None = None) -> list[VocabPair]:
