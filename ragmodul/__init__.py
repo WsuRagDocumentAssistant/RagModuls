@@ -36,7 +36,6 @@ from .controller import RagController
 from .models.chunk_model import ChildChunk, ChunkedDocument, ParentChunk
 from .models.search_model import RetrievedChild, RetrievedContext
 from .service.chunker_service import chunk
-from .service.db_service import DbService
 from .service.embedded_service import EmbeddedService
 from .service.ocr_service import OcrService
 from .service.parser_service import parse
@@ -57,6 +56,5 @@ __all__ = [
     "chunk",
     "EmbeddedService",
     "RerankerService",
-    "DbService",
     "OcrService",
 ]

@@ -25,14 +25,7 @@ logger = logging.getLogger(__name__)
 # 로컬 개발용 접속 기본값. 애플리케이션이 config 인자로 항목을 덮어쓸 수 있다
 # (main.py 의 build_db_config 가 .env 를 읽어 넘긴다). 넘긴 항목만 덮어쓰므로
 # 비밀번호 하나만 줘도 나머지는 아래 값이 남는다.
-DB_CONFIG = {
-    "host": "localhost",
-    "port": 5432,
-    "dbname": "postgres",
-    "user": "postgres",
-    "password": "1234",
-    "client_encoding": "utf-8",
-}
+
 
 # sparse 차원은 임베딩 모델의 vocab 크기다. 모델이 EmbeddedService.sparse_dimension
 # 으로 알려주므로 컨트롤러가 그 값을 넘긴다. 아래는 모델 없이 DbService 만 쓸 때의
@@ -45,7 +38,7 @@ class DbService:
     def __init__(self, config: dict | None = None, sparse_dim: int = DEFAULT_SPARSE_DIM) -> None:
         # 통째로 갈아끼우지 않고 덮어쓴다. 바꾸고 싶은 항목만 넘기면 되고,
         # client_encoding 처럼 매번 적기 번거로운 값은 기본값이 남는다.
-        self.config = {**DB_CONFIG, **(config or {})}
+        self.config = { **(config or {})}
         self.sparse_dim = sparse_dim
         self._conn: psycopg.Connection | None = None
         self.load()
