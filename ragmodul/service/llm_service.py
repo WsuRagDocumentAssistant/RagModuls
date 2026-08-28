@@ -442,7 +442,7 @@ class LlmService:
     def extract_vocab(self, text: str, provider: str | None = None) -> list[VocabPair]:
         return _run(self.aextract_vocab(text, provider))
 
-    def extract_vocab_all(self, texts: list[str], enable_web_search: bool = False,provider: str | None = None,
+    def extract_vocab_all(self, texts: list[str], enable_web_search: bool,provider: str | None = None,
                           parallel: bool = True, max_concurrent: int = 4,
                           ) -> list[VocabPair]:
         return _run(self.aextract_vocab_all(texts,enable_web_search, provider, parallel, max_concurrent))

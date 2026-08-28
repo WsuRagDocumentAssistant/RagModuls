@@ -304,7 +304,7 @@ class RagController:
         """
         return pack_texts(texts, max_chars)
 
-    def extract_vocab_all(self, texts: list[str], provider: str | None = None,
+    def extract_vocab_all(self, texts: list[str], enable_web_search: bool = False,provider: str | None = None,
                           parallel: bool = True, max_concurrent: int = 4,
                           ) -> list[VocabPair]:
         """조각마다 축약어를 뽑아 합친다. 같은 짝은 한 번만 남긴다.
