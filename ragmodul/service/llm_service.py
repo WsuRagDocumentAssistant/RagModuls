@@ -58,6 +58,16 @@ CLOUD_MAX_TOKENS = 8192
 # 400 이 난다("you requested 8192 output tokens ... upper bound for 0 input tokens").
 LOCAL_MAX_TOKENS = 2048
 
+# 로컬에 실을 맥락 상한(글자). 실측으로 계산했다 —
+#   컨텍스트 8192 토큰, 한국어 글자당 0.68 토큰(12,000자 = 8,185 토큰)
+#   8192 - 2048(출력) - 1,400(답변 시스템 프롬프트) ≈ 4,700 토큰 ≈ 6,900자
+# 여유를 두고 6,500 으로 잡는다.
+#
+# 없으면 실제로 터진다: 문서와 무관한 질의가 오면 조각이 여러 부모에 흩어지고 섹션이
+# 전부 승격돼(child 하나뿐인 부모는 hit 1개로 비율 1.0) 맥락이 17,286자가 됐다.
+# 게이트웨이가 413 Payload Too Large 로 잘랐다.
+LOCAL_CONTEXT_CHARS = 6500
+
 # temperature 를 보내면 400 이 나는 provider. claude 는 ai-rag-comm 이 경고 후 무시하고,
 # gemini/local 은 정상으로 받는다. gpt 만 모델이 거부한다 —
 # "does not support 0.0 with this model. Only the default (1) value is supported".
@@ -78,8 +88,13 @@ class _Provider:
     base_url: str | None = None
     headers: dict | None = None
     timeout: float | None = None
+    # 맥락에 실을 수 있는 글자 수. None 이면 제한하지 않는다(클라우드는 넉넉하다).
+    context_chars: int | None = None
     llm_api_config: Any = field(default=None, repr=False)
-    channel: Any = field(default=None, repr=False)
+    # 웹서치 여부로 채널이 갈린다. enable_web_search 가 RestChannel 의 생성자 인자라
+    # 호출마다 켜고 끌 수 없어서, 켠 것과 끈 것을 따로 들고 있는다.
+    # 채널은 껍데기고 무거운 HTTP 클라이언트는 ai-rag-comm 의 모듈 캐시가 관리한다.
+    channels: dict = field(default_factory=dict, repr=False)
 
 
 class LlmService:
@@ -132,6 +147,7 @@ class LlmService:
                 base_url=local_llm_config.base_url,
                 headers=getattr(local_llm_config, "headers", None),
                 timeout=getattr(local_llm_config, "timeout", None),
+                context_chars=LOCAL_CONTEXT_CHARS,
             )
 
         if not self._providers:
@@ -149,7 +165,8 @@ class LlmService:
 
     #------------------------------------------------┌> 답변 (async 본체)
 
-    async def aanswer(self, query: str, contexts: list, provider: str | None = None) -> str:
+    async def aanswer(self, query: str, contexts: list, provider: str | None = None,
+                      web_search: bool = True) -> str:
         """검색된 맥락으로 질문에 답한다.
 
         contexts 는 rerank() 를 지난 RetrievedContext 목록이다. 출처(breadcrumb)를
@@ -158,17 +175,21 @@ class LlmService:
         쓰인다.
 
         구조화 출력을 쓰지 않는다. 결과물이 서식(수치에 이탤릭·밑줄)이 붙은 평문이라
-        JSON 스키마로 감싸면 서식과 싸운다.
+        JSON 스키마로 감싸면 서식과 싸운다. 그래서 웹서치를 켤 수 있다.
+
+        web_search 기본이 켜짐이다. 맥락에 없는 것을 물으면 모델이 웹에서 찾아
+        보완한다. 로컬은 지원하지 않아 무시된다(초안 모델이 로컬이면 자동으로 꺼진다).
         """
-        block = _format_contexts(contexts)
+        prov = self._provider(provider)
+        block, used = _format_contexts(contexts, prov.context_chars)
         system, user = get_prompt("answer", context=block, query=query)
-        text = await self.aask(user, provider, system=system)
+        text = await self.aask(user, provider, system=system, web_search=web_search)
         logger.info("[%s] 답변: 맥락 %d개(%d자) -> %d자",
-                    provider or self.default, len(contexts), len(block), len(text))
+                    provider or self.default, used, len(block), len(text))
         return text
 
     async def arefine(self, query: str, contexts: list, draft: str,
-                      provider: str | None = None) -> str:
+                      provider: str | None = None, web_search: bool = True) -> str:
         """다른 모델이 만든 답변 초안을 Context 와 견주어 고친다.
 
         local_llm 이 초안을 만들고 사용자가 고른 모델이 다듬는 흐름에 쓴다.
@@ -179,21 +200,25 @@ class LlmService:
         경로가 필요한데, 그때는 초안의 오류를 그대로 물려받는다.
 
         초안이 비어 있으면 호출하지 않는다 — 다듬을 게 없다.
+
+        web_search 기본이 켜짐이다. 초안이 로컬 모델이라 바깥을 못 보므로, 다듬는
+        쪽에서 웹을 뒤져 보완한다.
         """
         if not draft or not draft.strip():
             logger.warning("초안이 비어 있다. 다듬기를 건너뛴다.")
             return ""
 
-        block = _format_contexts(contexts)
+        prov = self._provider(provider)
+        block, used = _format_contexts(contexts, prov.context_chars)
         system, user = get_prompt("refine", context=block, query=query, draft=draft)
-        text = await self.aask(user, provider, system=system)
-        logger.info("[%s] 다듬기: 초안 %d자 + 맥락 %d자 -> %d자",
-                    provider or self.default, len(draft), len(block), len(text))
+        text = await self.aask(user, provider, system=system, web_search=web_search)
+        logger.info("[%s] 다듬기: 초안 %d자 + 맥락 %d개(%d자) -> %d자",
+                    provider or self.default, len(draft), used, len(block), len(text))
         return text
 
     async def arefine_all(self, query: str, contexts: list, draft: str,
                           providers: list[str], parallel: bool = True,
-                          ) -> dict[str, str]:
+                          web_search: bool = True) -> dict[str, str]:
         """고른 모델들이 같은 초안을 각자 다듬는다. {provider: 다듬은 답변}.
 
         하나가 죽어도 나머지는 돌려준다 — 한도(429)나 키 없음으로 한쪽만 실패하는 게
@@ -214,23 +239,23 @@ class LlmService:
         벌어진다.
         """
         # 중복을 지우면서 순서는 유지한다 — 결과 dict 의 순서가 요청 순서와 맞는다
-        
         targets = list(dict.fromkeys(p for p in providers if p))
         if not targets:
-            print("왔나?")
             return {}
 
         if parallel:
             # return_exceptions 를 안 켜면 하나가 터질 때 나머지가 취소되고 예외만 올라온다
             results = await asyncio.gather(
-                *(self.arefine(query, contexts, draft, name) for name in targets),
+                *(self.arefine(query, contexts, draft, name, web_search)
+                  for name in targets),
                 return_exceptions=True,
             )
         else:
             results = []
             for name in targets:
                 try:
-                    results.append(await self.arefine(query, contexts, draft, name))
+                    results.append(
+                        await self.arefine(query, contexts, draft, name, web_search))
                 except Exception as e:
                     results.append(e)
 
@@ -263,14 +288,16 @@ class LlmService:
         blocks = "\n\n".join(f"<답변{i}>\n{a}\n</답변{i}>"
                              for i, a in enumerate(answers, 1))
         system, user = get_prompt("merge", question=question, answers=blocks)
-        text = await self.aask(user, provider, system=system, enable_web_search=False)
+        # 병합은 웹서치를 안 쓴다. 이미 만들어진 답변들을 합치는 일이라 바깥을 볼
+        # 이유가 없고, 켜면 없던 내용이 새로 섞여 들어온다.
+        text = await self.aask(user, provider, system=system)
         logger.info("[%s] 병합: %s -> %d자", provider or self.default,
                     " + ".join(f"{len(a):,}자" for a in answers), len(text))
         return text
 
     #------------------------------------------------┌> 축약어 사전 (async 본체)
 
-    async def aextract_vocab(self, text: str, enable_web_search: bool ,provider: str | None = None) -> list[VocabPair]:
+    async def aextract_vocab(self, text: str, provider: str | None = None) -> list[VocabPair]:
         """텍스트에서 축약어 짝을 뽑는다.
 
         문서 전체를 한 덩어리로 넣는다. 부모별로 나눠 32번 부르면 표기 변형
@@ -278,15 +305,19 @@ class LlmService:
         때문이다. 놓치는 건 recheck_vocab 으로 메운다.
 
         로컬 모델은 컨텍스트가 8192 토큰이라 문서 전체(약 45k)를 못 받는다. 클라우드로.
+
+        웹서치는 쓰지 않는다. 문서에서 뽑는 작업이라 바깥을 볼 이유가 없고, 웹서치를
+        켜면 ai-rag-comm 이 response_format 을 경고만 남기고 버려서 구조화 출력이
+        깨진다(gemini 는 tools 와 response_schema 를 같이 못 쓴다).
         """
         system, user = get_prompt("vocab", text=text)
-        result = await self.asend(user, VocabPairs, provider, system=system, enable_web_search=enable_web_search)
+        result = await self.asend(user, VocabPairs, provider, system=system)
         if result is None:
             logger.warning("축약어 추출 실패: %s...", text[:40])
             return []
         return list(result.pairs)
 
-    async def aextract_vocab_all(self, texts: list[str], enable_web_search:bool,provider: str | None = None,
+    async def aextract_vocab_all(self, texts: list[str], provider: str | None = None,
                                  parallel: bool = True, max_concurrent: int = 4,
                                  ) -> list[VocabPair]:
         """여러 조각에서 각각 뽑아 합친다. 같은 짝은 한 번만 남긴다.
@@ -311,7 +342,7 @@ class LlmService:
 
         async def one(index: int, text: str):
             async with semaphore:
-                pairs = await self.aextract_vocab(text, provider, enable_web_search=enable_web_search)
+                pairs = await self.aextract_vocab(text, provider)
                 logger.info("사전 추출 %d/%d: %d자 -> %d짝",
                             index, len(texts), len(text), len(pairs))
                 return pairs
@@ -335,8 +366,7 @@ class LlmService:
         return merged
 
     async def arecheck_vocab(self, text: str, found: list[VocabPair],
-                             enable_web_search: bool,
-                             provider: str | None = None, 
+                             provider: str | None = None,
                              ) -> list[VocabPair]:
         """이미 뽑은 목록을 보여주고 빠뜨린 축약어를 다시 훑게 한다.
 
@@ -347,7 +377,7 @@ class LlmService:
         """
         listing = "\n".join(f"- {p.term} -> {p.expansion}" for p in found) or "(없음)"
         system, user = get_prompt("vocab_recheck", found=listing, text=text)
-        result = await self.asend(user, VocabPairs, provider, system=system, enable_web_search=enable_web_search)
+        result = await self.asend(user, VocabPairs, provider, system=system)
         if result is None:
             logger.warning("축약어 재검토 실패")
             return []
@@ -357,10 +387,10 @@ class LlmService:
         logger.info("재검토: %d개 중 새로 %d개", len(result.pairs), len(fresh))
         return fresh
 
-    async def aextract_query_terms(self, query: str,  enable_web_search: bool,provider: str | None = None,) -> list[str]:
+    async def aextract_query_terms(self, query: str, provider: str | None = None) -> list[str]:
         """사용자 질의에 나온 축약어를 뽑는다. 이걸 vocab_short 에서 찾아 확장어를 붙인다."""
         system, user = get_prompt("query_terms", query=query)
-        result = await self.asend(user, QueryTerms, provider, system=system, enable_web_search=enable_web_search)
+        result = await self.asend(user, QueryTerms, provider, system=system)
         if result is None:
             logger.warning("질의 축약어 추출 실패: %s", query[:40])
             return []
@@ -370,12 +400,16 @@ class LlmService:
 
     async def asend(self, prompt: str, schema: type[BaseModel],
                     provider: str | None = None, system: str | None = None,
-                    retries: int = 1, enable_web_search: bool = False) -> BaseModel | None:
+                    retries: int = 1) -> BaseModel | None:
         """스키마를 강제해 받고 검증한다. 끝까지 실패하면 None.
 
         structured 면 response_format 으로 API 가 형식을 보장한다. 아니면 지시 뒤에
         JSON Schema 를 붙이고 평문에서 떼어낸다 — 데이터가 길 때(문서 전체 추출은
         9만 자) 형식 지시가 앞에 있으면 묻히므로 뒤에 붙인다.
+
+        웹서치는 여기서 절대 켜지 않는다. 켜면 ai-rag-comm 이 response_format 을
+        경고만 남기고 버려서 형식 보장이 사라진다(gemini 는 tools 와 response_schema 를
+        같은 요청에 못 쓴다). 구조화 출력과 웹서치는 함께 못 간다.
 
         예외로 올리지 않는 이유: 청크 수백 개를 돌리는 중에 하나가 어긋났다고
         전체가 멈출 이유가 없다.
@@ -390,7 +424,7 @@ class LlmService:
 
         name = provider or self.default
         for attempt in range(retries + 1):
-            text = await self.aask(prompt, provider, system=system, response_format=fmt, enable_web_search=enable_web_search)
+            text = await self.aask(prompt, provider, system=system, response_format=fmt)
             parsed = _extract(schema, text)
             if parsed is not None:
                 return parsed
@@ -400,13 +434,19 @@ class LlmService:
     async def aask(self, prompt: str, provider: str | None = None,
                    system: str | None = None,
                    response_format: dict | None = None,
-                   enable_web_search: bool =True
-                   ) -> str:
+                   web_search: bool = False) -> str:
         """채널로 보내고 평문을 받는다.
 
         response_format 에는 '알맹이' JSON Schema 만 넣는다. provider 별 봉투는
         ai-rag-comm 이 씌운다 — 우리가 미리 씌우면 이중으로 감싸져 400 이 난다.
+
+        web_search 는 기본이 꺼짐이다. 켜면 클라우드 provider 가 웹을 뒤져 답한다
+        (로컬은 지원하지 않아 무시된다). response_format 과 함께 쓰면 형식 보장이
+        사라지므로 둘을 같이 주지 않는다.
         """
+        if web_search and response_format is not None:
+            logger.warning("웹서치와 구조화 출력은 함께 못 씁니다. 웹서치를 끕니다.")
+            web_search = False
         prov = self._provider(provider)
         payload: dict[str, Any] = {
             "prompt": prompt,
@@ -419,21 +459,24 @@ class LlmService:
             payload["temperature"] = prov.temperature
         if response_format is not None:
             payload["response_format"] = response_format
-        return await self._channel(prov, enable_web_search).call(payload) or ""
+        return await self._channel(prov, web_search).call(payload) or ""
 
 
     #------------------------------------------------┌> 동기 껍데기
 
-    def answer(self, query: str, contexts: list, provider: str | None = None) -> str:
-        return _run(self.aanswer(query, contexts, provider))
+    def answer(self, query: str, contexts: list, provider: str | None = None,
+               web_search: bool = True) -> str:
+        return _run(self.aanswer(query, contexts, provider, web_search))
 
     def refine(self, query: str, contexts: list, draft: str,
-               provider: str | None = None) -> str:
-        return _run(self.arefine(query, contexts, draft, provider))
+               provider: str | None = None, web_search: bool = True) -> str:
+        return _run(self.arefine(query, contexts, draft, provider, web_search))
 
     def refine_all(self, query: str, contexts: list, draft: str,
-                   providers: list[str], parallel: bool = True) -> dict[str, str]:
-        return _run(self.arefine_all(query, contexts, draft, providers, parallel))
+                   providers: list[str], parallel: bool = True,
+                   web_search: bool = True) -> dict[str, str]:
+        return _run(self.arefine_all(query, contexts, draft, providers, parallel,
+                                     web_search))
 
     def merge(self, question: str, answers: list[str],
               provider: str | None = None) -> str:
@@ -442,10 +485,10 @@ class LlmService:
     def extract_vocab(self, text: str, provider: str | None = None) -> list[VocabPair]:
         return _run(self.aextract_vocab(text, provider))
 
-    def extract_vocab_all(self, texts: list[str], enable_web_search: bool,provider: str | None = None,
+    def extract_vocab_all(self, texts: list[str], provider: str | None = None,
                           parallel: bool = True, max_concurrent: int = 4,
                           ) -> list[VocabPair]:
-        return _run(self.aextract_vocab_all(texts,enable_web_search, provider, parallel, max_concurrent))
+        return _run(self.aextract_vocab_all(texts, provider, parallel, max_concurrent))
 
     def recheck_vocab(self, text: str, found: list[VocabPair],
                       provider: str | None = None) -> list[VocabPair]:
@@ -455,8 +498,9 @@ class LlmService:
         return _run(self.aextract_query_terms(query, provider))
 
     def ask(self, prompt: str, provider: str | None = None,
-            system: str | None = None, response_format: dict | None = None) -> str:
-        return _run(self.aask(prompt, provider, system, response_format))
+            system: str | None = None, response_format: dict | None = None,
+            web_search: bool = False) -> str:
+        return _run(self.aask(prompt, provider, system, response_format, web_search))
 
     #------------------------------------------------┌> 관리
 
@@ -479,10 +523,11 @@ class LlmService:
         """
         self._closed = True
         for prov in self._providers.values():
-            closer = getattr(prov.channel, "aclose", None)
-            if closer is not None:
-                await closer()
-            prov.channel = None
+            for channel in prov.channels.values():      # 웹서치 켠 것/끈 것 둘 다
+                closer = getattr(channel, "aclose", None)
+                if closer is not None:
+                    await closer()
+            prov.channels.clear()
 
     def close(self) -> None:
         """동기 쪽에서 부르는 정리. 채널을 닫고 이 스레드의 루프까지 닫는다."""
@@ -499,11 +544,18 @@ class LlmService:
                 f"모르는 provider: {name!r} (있는 것: {', '.join(self._providers)})")
         return prov
 
-    def _channel(self, prov: _Provider, enable_web_search :bool):
-        """채널을 처음 쓸 때 만들어 붙들고 있는다.
+    def _channel(self, prov: _Provider, web_search: bool = False):
+        """채널을 처음 쓸 때 만들어 붙들고 있는다. 웹서치 여부로 따로 만든다.
 
         생성자에서 다 만들지 않는 이유: 넷을 등록해도 실제로 쓰는 건 한둘일 때가 많고,
         채널을 만들면 HTTP 클라이언트와 연결 풀이 생긴다.
+
+        웹서치는 RestChannel 의 생성자 인자라 호출마다 못 바꾼다. 그래서 켠 채널과 끈
+        채널을 둘 다 들고 필요한 쪽을 준다. 하나만 붙들면 먼저 만들어진 쪽이 계속
+        쓰여서, 구조화 출력이 필요한 호출까지 웹서치 채널로 나간다(그러면 모듈이
+        response_format 을 경고만 남기고 버린다).
+
+        로컬은 웹서치를 지원하지 않으므로 플래그와 무관하게 하나만 쓴다.
         """
         # close() 뒤에는 채널을 다시 만들어도 못 쓴다. ai-rag-comm 의 _client_cache 가
         # 모듈 전역이라 닫힌 클라이언트를 그대로 돌려주고, 그때 나는 에러가
@@ -514,22 +566,26 @@ class LlmService:
                 "이미 close() 한 LlmService 입니다. close() 는 종료용이라 되돌릴 수 "
                 "없습니다 — 다시 쓰려면 LlmService 를 새로 만드세요."
             )
-        if prov.channel is not None:
-            return prov.channel
-
         if prov.base_url:
-            from ai_rag_comm import LocalLLMChannel
+            key = False                     # 로컬은 웹서치가 없어 하나로 충분하다
+            if key not in prov.channels:
+                from ai_rag_comm import LocalLLMChannel
 
-            prov.channel = LocalLLMChannel(
-                prov.base_url, prov.model, prov.headers, prov.timeout)
-            logger.info("[%s] LocalLLMChannel @ %s", prov.name, prov.base_url)
-        else:
+                prov.channels[key] = LocalLLMChannel(
+                    prov.base_url, prov.model, prov.headers, prov.timeout)
+                logger.info("[%s] LocalLLMChannel @ %s", prov.name, prov.base_url)
+            return prov.channels[key]
+
+        key = bool(web_search)
+        if key not in prov.channels:
             from ai_rag_comm import AIProvider, RestChannel
 
-            prov.channel = RestChannel(
-                prov.llm_api_config, AIProvider(prov.name), prov.model,enable_web_search=True)
-            logger.info("[%s] RestChannel / %s", prov.name, prov.model)
-        return prov.channel
+            prov.channels[key] = RestChannel(
+                prov.llm_api_config, AIProvider(prov.name), prov.model,
+                enable_web_search=key)
+            logger.info("[%s] RestChannel / %s (웹서치 %s)",
+                        prov.name, prov.model, "켬" if key else "끔")
+        return prov.channels[key]
 
 
 #------------------------------------------------┌> 모듈 내부
@@ -611,8 +667,11 @@ def _strictify(node) -> None:
         _strictify(value)
 
 
-def _format_contexts(contexts: list) -> str:
-    """검색 결과를 번호와 출처가 붙은 블록으로 만든다.
+def _format_contexts(contexts: list, max_chars: int | None = None) -> tuple[str, int]:
+    """검색 결과를 번호와 출처가 붙은 블록으로 만든다. (블록 문자열, 담은 개수).
+
+    담은 개수를 같이 돌려주는 이유: 예산에 걸려 잘리면 받은 개수와 보낸 개수가
+    달라진다. 로그에 받은 개수만 찍으면 5개를 보낸 것처럼 보인다.
 
     출처(breadcrumb)를 붙이는 이유가 두 개다. 어느 맥락을 근거로 답했는지 확인할 수
     있어야 하고, 한 섹션 안에 비슷한 항목이 여러 개일 때(세부과제 2-1 과 2-2 가 같은
@@ -620,16 +679,32 @@ def _format_contexts(contexts: list) -> str:
 
     RetrievedContext 를 받지만 타입을 보지 않는다 — content/breadcrumb 만 쓴다.
     문자열 목록을 넘겨도 돈다.
+
+    max_chars 를 주면 위(리랭크 상위)에서부터 담다가 넘칠 맥락에서 멈춘다. 개수로
+    자르지 않는 이유는 부모 크기 편차가 크기 때문이다 — 실측으로 25자에서 5,987자다.
+    3개로 제한해도 최악이면 17,961자라 컨텍스트가 좁은 모델을 넘긴다.
+
+    맨 위 하나는 예산을 넘겨도 담는다. 맥락 없이 답하면 모델이 아는 대로 지어내는데,
+    차라리 요청이 400/413 으로 실패해서 원인이 보이는 편이 낫다.
     """
-    blocks = []
+    blocks: list[str] = []
+    total = 0
     for i, context in enumerate(contexts, 1):
         if isinstance(context, str):
-            blocks.append(f"[{i}]\n{context}")
-            continue
-        source = getattr(context, "breadcrumb", "") or getattr(context, "heading", "") or ""
-        head = f"[{i}] 출처: {source}" if source else f"[{i}]"
-        blocks.append(f"{head}\n{getattr(context, 'content', '')}")
-    return "\n\n".join(blocks)
+            block = f"[{i}]\n{context}"
+        else:
+            source = (getattr(context, "breadcrumb", "")
+                      or getattr(context, "heading", "") or "")
+            head = f"[{i}] 출처: {source}" if source else f"[{i}]"
+            block = f"{head}\n{getattr(context, 'content', '')}"
+
+        if max_chars is not None and blocks and total + len(block) > max_chars:
+            logger.info("맥락 자름: %d개 중 %d개만 (%d자, 상한 %d자)",
+                        len(contexts), len(blocks), total, max_chars)
+            break
+        blocks.append(block)
+        total += len(block)
+    return "\n\n".join(blocks), len(blocks)
 
 
 def _extract(schema: type[BaseModel], text: str) -> BaseModel | None:

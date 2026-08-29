@@ -19,6 +19,15 @@ from psycopg.rows import dict_row
 
 logger = logging.getLogger(__name__)
 
+# 접속에 항상 붙이는 고정 옵션. 배포마다 달라지는 값(host/port/dbname/user/password)은
+# 여기 두지 않는다 — 애플리케이션이 config 로 넘긴다(main.py 의 build_db_config 가
+# .env 를 읽는다).
+#
+# 기본값을 두면 .env 에서 항목이 빠졌을 때 조용히 그 값으로 붙는다. DB_HOST 를 깜빡하면
+# 에러 대신 localhost 에 연결돼서 "테이블이 없다" 같은 엉뚱한 에러를 보게 된다.
+DB_OPTIONS = {
+    "client_encoding": "utf-8",
+}
 
 # sparse 차원은 임베딩 모델의 vocab 크기다. 모델이 EmbeddedService.sparse_dimension
 # 으로 알려주므로 컨트롤러가 그 값을 넘긴다. 아래는 모델 없이 DbService 만 쓸 때의
@@ -29,7 +38,8 @@ DEFAULT_SPARSE_DIM = 250002
 class DbService:
 
     def __init__(self, config: dict | None = None, sparse_dim: int = DEFAULT_SPARSE_DIM) -> None:
-        self.config = dict(config or DB_CONFIG)
+        # 고정 옵션 위에 애플리케이션이 준 접속 정보를 얹는다.
+        self.config = {**DB_OPTIONS, **(config or {})}
         self.sparse_dim = sparse_dim
         self._conn: psycopg.Connection | None = None
         self.load()
@@ -260,9 +270,13 @@ class DbService:
                     sparse.similarity AS sparse_score,
                     COALESCE(1.0 / (%s + dense.rank),  0)
                   + COALESCE(1.0 / (%s + sparse.rank), 0) AS similarity
+                -- USING (id) 를 쓰면 합쳐진 id 가 뒤이어 조인하는 child_chunk.id 와
+                -- 이름이 겹쳐 "칼럼 참조 id 가 모호합니다" 가 난다. ON 으로 붙이고
+                -- COALESCE 로 어느 쪽에서 왔든 id 를 하나 고른다(FULL OUTER 라
+                -- 한쪽만 잡힌 행은 반대쪽이 NULL 이다).
                 FROM dense
-                FULL OUTER JOIN sparse USING (id)
-                JOIN child_chunk  c ON c.id = id
+                FULL OUTER JOIN sparse ON sparse.id = dense.id
+                JOIN child_chunk  c ON c.id = COALESCE(dense.id, sparse.id)
                 JOIN parent_chunk p ON p.id = c.parent_id
                 JOIN document     d ON d.id = c.document_id
                 ORDER BY similarity DESC
@@ -273,6 +287,68 @@ class DbService:
                  k, k, top_k],
             )
             return cur.fetchall()
+
+    # ── 축약어 사전 ──────────────────────────────────────────────────────
+
+    def save_vocab(self, pairs) -> int:
+        """축약어/확장어 짝을 넣고 새로 들어간 확장어 수를 돌려준다.
+
+        pairs 는 납작한 VocabPair 목록이라 같은 축약어가 여러 번 올 수 있다
+        (실측: 축약어 16개에 확장어 17개 — PAMS 가 둘이다). 먼저 축약어로 묶어서
+        vocab_short 를 축약어당 한 번만 건드린다.
+
+        이미 있는 축약어는 그 id 를 재사용한다. 새 행을 만들면 확장어가 두 id 로
+        흩어져 조회에서 절반만 나온다.
+        """
+        by_term: dict[str, list[str]] = {}
+        for pair in pairs:
+            expansions = by_term.setdefault(pair.term, [])
+            if pair.expansion not in expansions:        # 호출 안 중복 제거
+                expansions.append(pair.expansion)
+
+        added = 0
+        with self._conn.cursor() as cur:
+            for term, expansions in by_term.items():
+                # DO NOTHING 이면 RETURNING 이 아무것도 안 주므로 id 는 따로 읽는다.
+                # 사전이 십여 개라 왕복이 늘어도 상관없고, 이쪽이 읽기 쉽다.
+                cur.execute(
+                    "INSERT INTO vocab_short (term) VALUES (%s) ON CONFLICT (term) DO NOTHING;",
+                    (term,),
+                )
+                cur.execute("SELECT id FROM vocab_short WHERE term = %s;", (term,))
+                short_id = cur.fetchone()["id"]
+
+                for expansion in expansions:
+                    cur.execute(
+                        """
+                        INSERT INTO vocab_expansion (short_id, term) VALUES (%s, %s)
+                        ON CONFLICT (short_id, term) DO NOTHING;
+                        """,
+                        (short_id, expansion),
+                    )
+                    added += cur.rowcount               # 건너뛰면 0 이다
+        self._conn.commit()
+        logger.info("사전 저장: 축약어 %d개, 확장어 %d개 추가", len(by_term), added)
+        return added
+
+    def load_vocab(self) -> dict[str, list[str]]:
+        """{축약어: [확장어, ...]} 를 통째로 읽는다.
+
+        질의마다 DB 를 치지 않고 한 번 올려두고 쓴다 — 사전이 십여 개다.
+        """
+        with self._conn.cursor() as cur:
+            cur.execute(
+                """
+                SELECT s.term AS short, e.term AS expansion
+                FROM vocab_short s
+                JOIN vocab_expansion e ON e.short_id = s.id
+                ORDER BY s.term, e.term;
+                """
+            )
+            vocab: dict[str, list[str]] = {}
+            for row in cur.fetchall():
+                vocab.setdefault(row["short"], []).append(row["expansion"])
+            return vocab
 
     # ── 조회 도우미 ──────────────────────────────────────────────────────
 

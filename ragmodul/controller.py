@@ -40,6 +40,7 @@ class RagController:
         reranker_max_length: int = 512,
         unpack_dir: str = "unpacked",
         image_dir: str | None = None,
+        use_db: bool = True,
         db_config: dict | None = None,
         llm_api_config=None,
         local_llm_config=None,
@@ -56,6 +57,12 @@ class RagController:
         llm_api_config / local_llm_config 는 ai-rag-comm 의 load_config() 결과를
         넘긴다(cfg.llm_api, cfg.local_llm). 둘 다 없으면 self.llm 은 None 이고
         검색까지만 된다.
+
+        use_db 는 이 모듈이 DB 에 직접 붙을지다. 운영에서는 DB 쪽 프로시저를 RagSystem
+        이 조합해 부르므로 False 로 끈다. False 면 커넥션을 안 만들고, 저장·검색·사전
+        단계는 ValueError 로 막힌다.
+        db_config 는 psycopg 인자다(host/port/dbname/user/password). 넘긴 항목만
+        DbService 의 기본값을 덮어쓴다 — 비밀번호 하나만 줘도 나머지는 기본값이 쓰인다.
         """
         self.embedding_model_path = embedding_model_path
         self.reranker_model_path = reranker_model_path
@@ -84,12 +91,19 @@ class RagController:
             device=device,
             use_fp16=use_fp16,
         )
+        # DB 에 직접 붙는 건 이 저장소 안에서 돌려보기 위한 것이다. 운영에서는 DB 쪽이
+        # 만든 프로시저를 RagSystem 이 조합해 부르므로 ragmodul 이 커넥션을 들 이유가
+        # 없다. use_db=False 로 끄면 커넥션을 아예 안 만들고, DB 를 쓰는 단계는
+        # ValueError 로 막는다(조용히 None 을 돌려주면 원인을 못 찾는다).
+        #
         # sparse 차원은 하드코딩하지 않고 모델에게 묻는다(= 토크나이저 vocab 크기).
         # sql/schema.sql 의 SPARSEVEC(N) 과 이 값이 어긋나면 저장에서 실패한다.
-        # self._db = DbService(
-        #     config=db_config,
-        #     sparse_dim=self._embedder.sparse_dimension,
-        # )
+        self._db = None
+        if use_db:
+            self._db = DbService(
+                config=db_config,
+                sparse_dim=self._embedder.sparse_dimension,
+            )
         # LLM 설정을 안 준 사람은 LLM 스택을 안 깐 사람이다(ragmodul[llm] 은 선택
         # 의존성). import 를 여기 두는 건 그래서다 — 모듈 맨 위에 두면 검색만 쓰는
         # 사람이 ragmodul 을 import 조차 못 한다. 객체 자체는 만들어 둔다. 설정을
@@ -136,7 +150,7 @@ class RagController:
 
     def save_to_vector_db(self, document: ChunkedDocument) -> int:
         """저장하고 저장한 child 수를 돌려준다."""
-        self._db.save_document(document)
+        self._require_db().save_document(document)
         logger.info("DB 저장 완료: %d개", len(document.children()))
         return len(document.children())
 
@@ -176,7 +190,7 @@ class RagController:
         query_weights 가 없으면 dense 단독으로 떨어진다.
         """
         logger.info("검색: top_k=%d (%s)", top_k, "hybrid" if query_weights else "dense")
-        return self._db.search_hybrid(query_vector, query_weights, top_k)
+        return self._require_db().search_hybrid(query_vector, query_weights, top_k)
 
     def build_contexts(self, hits: list, merge_ratio: float = DEFAULT_MERGE_RATIO,
                        limit: int | None = None) -> list[RetrievedContext]:
@@ -211,16 +225,24 @@ class RagController:
 
     #------------------------------------------------┌> 답변 생성 (선택 의존성)
 
-    def answer(self, query: str, contexts: list, provider: str | None = None) -> str:
-        """검색된 맥락으로 답변을 만든다. rerank() 다음 단계다."""
-        return self._require_llm().answer(query, contexts, provider=provider)
+    def answer(self, query: str, contexts: list, provider: str | None = None,
+               web_search: bool = True) -> str:
+        """검색된 맥락으로 답변을 만든다. rerank() 다음 단계다.
 
-    async def aanswer(self, query: str, contexts: list, provider: str | None = None) -> str:
+        web_search 기본이 켜짐이다 — 맥락에 없는 것을 물으면 모델이 웹에서 찾아
+        보완한다. 로컬 provider 는 지원하지 않아 무시된다.
+        """
+        return self._require_llm().answer(query, contexts, provider=provider,
+                                          web_search=web_search)
+
+    async def aanswer(self, query: str, contexts: list, provider: str | None = None,
+                      web_search: bool = True) -> str:
         """answer() 의 async 판. 이미 이벤트 루프 안이면 이쪽을 await 한다."""
-        return await self._require_llm().aanswer(query, contexts, provider=provider)
+        return await self._require_llm().aanswer(query, contexts, provider=provider,
+                                                 web_search=web_search)
 
     def refine(self, query: str, contexts: list, draft: str,
-               provider: str | None = None) -> str:
+               provider: str | None = None, web_search: bool = True) -> str:
         """다른 모델이 만든 답변 초안을 다듬는다. LLM 한 번.
 
         local_llm 이 초안을 만들고 사용자가 고른 모델이 다듬는 단계다. 고른 모델이
@@ -228,17 +250,23 @@ class RagController:
         순차로 넘기면 앞 모델의 판단이 뒤로 갈수록 굳어진다.
 
         Context 를 함께 넘긴다. 사실 검증과 수치 서식 판단에 필요하다.
+
+        web_search 기본이 켜짐이다. 초안을 만든 로컬 모델은 바깥을 못 보므로 여기서
+        보완한다.
         """
-        return self._require_llm().refine(query, contexts, draft, provider=provider)
+        return self._require_llm().refine(query, contexts, draft, provider=provider,
+                                          web_search=web_search)
 
     async def arefine(self, query: str, contexts: list, draft: str,
-                      provider: str | None = None) -> str:
+                      provider: str | None = None, web_search: bool = True) -> str:
         """refine() 의 async 판."""
         return await self._require_llm().arefine(query, contexts, draft,
-                                                 provider=provider)
+                                                 provider=provider,
+                                                 web_search=web_search)
 
     def refine_all(self, query: str, contexts: list, draft: str,
-                   providers: list[str], parallel: bool = True) -> dict[str, str]:
+                   providers: list[str], parallel: bool = True,
+                   web_search: bool = True) -> dict[str, str]:
         """고른 모델들이 같은 초안을 각자 다듬는다. {provider: 다듬은 답변}.
 
         사용자가 한 질의에 모델을 여러 개 골랐을 때 쓰는 단계다. 목록 길이만큼
@@ -251,14 +279,14 @@ class RagController:
         대조하면 무엇이 빠졌는지 알 수 있다.
         """
         return self._require_llm().refine_all(query, contexts, draft, providers,
-                                              parallel)
+                                              parallel, web_search)
 
     async def arefine_all(self, query: str, contexts: list, draft: str,
                           providers: list[str], parallel: bool = True,
-                          ) -> dict[str, str]:
+                          web_search: bool = True) -> dict[str, str]:
         """refine_all() 의 async 판."""
         return await self._require_llm().arefine_all(query, contexts, draft,
-                                                     providers, parallel)
+                                                     providers, parallel, web_search)
 
     def merge(self, question: str, answers: list[str],
               provider: str | None = None) -> str:
@@ -304,7 +332,7 @@ class RagController:
         """
         return pack_texts(texts, max_chars)
 
-    def extract_vocab_all(self, texts: list[str], enable_web_search: bool = False,provider: str | None = None,
+    def extract_vocab_all(self, texts: list[str], provider: str | None = None,
                           parallel: bool = True, max_concurrent: int = 4,
                           ) -> list[VocabPair]:
         """조각마다 축약어를 뽑아 합친다. 같은 짝은 한 번만 남긴다.
@@ -314,8 +342,10 @@ class RagController:
 
         정확도는 통째로 한 번 보내는 것보다 낮다 — 조각 경계에서 앞의 정의와 뒤의
         사용이 갈라진다. 대신 한도(429)에 걸리지 않고 비용이 0이다.
+
+        웹서치는 쓰지 않는다. 문서에서 뽑는 작업이고, 켜면 구조화 출력이 깨진다.
         """
-        return self._require_llm().extract_vocab_all(texts, enable_web_search,provider, parallel,
+        return self._require_llm().extract_vocab_all(texts, provider, parallel,
                                                      max_concurrent)
 
     async def aextract_vocab_all(self, texts: list[str], provider: str | None = None,
@@ -347,13 +377,22 @@ class RagController:
 
         같은 것을 또 넣어도 늘지 않는다 — 재실행해도 사전이 부풀지 않는다.
         """
-        return self._db.save_vocab(pairs)
+        return self._require_db().save_vocab(pairs)
 
     def load_vocab(self) -> dict[str, list[str]]:
         """{축약어: [확장어, ...]}. 질의 확장이 이 형태로 쓴다."""
-        return self._db.load_vocab()
+        return self._require_db().load_vocab()
 
     #------------------------------------------------┌> 내부
+
+    def _require_db(self):
+        if self._db is None:
+            raise ValueError(
+                "DB 를 안 쓰도록 만들어졌습니다(use_db=False). 저장·검색·사전 단계는 "
+                "DB 가 필요합니다 — RagController(..., use_db=True, db_config={...}) 로 "
+                "만들거나, 그 단계를 DB 쪽 프로시저로 대체하세요."
+            )
+        return self._db
 
     def _require_llm(self):
         if self.llm is None:
