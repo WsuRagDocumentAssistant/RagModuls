@@ -108,6 +108,71 @@ def _norm(text: str) -> str:
     return _SPACE.sub("", text or "")
 
 
+#------------------------------------------------┌> 색인 페이로드
+
+# document 행에 들어가는 파서 정보.
+_FILE_FIELDS = ("filename", "title", "creator", "last_saved_by")
+_FILE_DATES = ("created_at", "modified_at")
+
+
+def document_to_payload(document) -> dict:
+    """ChunkedDocument -> save_document_json 프로시저가 받는 dict.
+
+    DB 에 SQL 로 직접 넣지 않고 저장 프로시저를 부를 때 쓴다.
+
+        db_call("index_document", document=document_to_payload(doc), sparse_dim=N)
+
+    키 이름을 프로시저에 맞춘다. DB 컬럼은 embedding/lexical 이지만 프로시저는
+    v_child->'vector' / v_child->'sparse' 를 읽는다. 이름이 틀리면 에러 없이 NULL 이
+    들어가서, 개수는 맞는데 embedded 가 0 이 된다(실측으로 겪었다).
+
+    numpy 를 걷어낸다 — json 이 numpy 배열도, numpy 정수 키도 직렬화하지 못한다.
+    날짜는 문자열로 편다.
+    """
+    file = document.file
+    payload: dict = {
+        "source_path": getattr(file, "filename", None) or getattr(file, "title", "") or "",
+    }
+    for name in _FILE_FIELDS:
+        payload[name] = getattr(file, name, None)
+    for name in _FILE_DATES:
+        value = getattr(file, name, None)
+        payload[f"doc_{name}"] = value.isoformat() if hasattr(value, "isoformat") else value
+
+    payload["parents"] = [
+        {
+            "heading": parent.heading,
+            "breadcrumb": parent.breadcrumb or "",
+            "content": parent.content,
+            "children": [
+                {
+                    "content": child.content,
+                    "vector": to_plain_vector(child.vector) if child.vector is not None else None,
+                    "sparse": to_plain_sparse(child.sparse) if child.sparse else None,
+                }
+                for child in parent.children
+            ],
+        }
+        for parent in document.parents
+    ]
+    return payload
+
+
+def to_plain_vector(vector) -> list:
+    """numpy 배열이면 list 로. json 이 numpy 를 직렬화하지 못한다."""
+    tolist = getattr(vector, "tolist", None)
+    return tolist() if tolist is not None else list(vector)
+
+
+def to_plain_sparse(weights: dict) -> dict:
+    """{토큰id: 가중치} 를 json 이 받는 형태로.
+
+    키를 문자열로 만든다. json 은 파이썬 정수 키를 알아서 문자열로 바꾸지만 numpy
+    정수는 그것조차 못 해서 TypeError 를 낸다. 값도 numpy float 일 수 있어 편다.
+    """
+    return {str(int(token)): float(weight) for token, weight in weights.items()}
+
+
 #------------------------------------------------┌> 글 묶기
 
 # 로컬 모델(gemma-4-12B-it) 한 요청에 들어가는 본문 크기. 실측으로 계산했다 —

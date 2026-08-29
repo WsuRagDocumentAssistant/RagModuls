@@ -40,6 +40,7 @@ from .service.embedded_service import EmbeddedService
 from .service.ocr_service import OcrService
 from .service.parser_service import parse
 from .service.reranker_service import RerankerService
+from .util import document_to_payload, expand_query, filter_vocab_pairs, pack_texts
 
 __all__ = [
     # 진입점
@@ -57,4 +58,9 @@ __all__ = [
     "EmbeddedService",
     "RerankerService",
     "OcrService",
+    # 순수 계산 도우미 — DB 를 직접 부르는 쪽(RagSystem)이 쓴다
+    "document_to_payload",   # ChunkedDocument -> save_document_json 페이로드
+    "expand_query",          # 질의에 축약어 짝 덧붙이기
+    "filter_vocab_pairs",    # 뽑은 축약어 짝 거르기
+    "pack_texts",            # 좁은 컨텍스트에 맞춰 글 묶기
 ]

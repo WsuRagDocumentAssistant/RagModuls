@@ -41,7 +41,9 @@ class RagController:
         unpack_dir: str = "unpacked",
         image_dir: str | None = None,
         use_db: bool = True,
+        db_backend: str = "direct",
         db_config: dict | None = None,
+        db_manager=None,
         llm_api_config=None,
         local_llm_config=None,
         llm_default: str | None = None,
@@ -58,11 +60,16 @@ class RagController:
         넘긴다(cfg.llm_api, cfg.local_llm). 둘 다 없으면 self.llm 은 None 이고
         검색까지만 된다.
 
-        use_db 는 이 모듈이 DB 에 직접 붙을지다. 운영에서는 DB 쪽 프로시저를 RagSystem
-        이 조합해 부르므로 False 로 끈다. False 면 커넥션을 안 만들고, 저장·검색·사전
-        단계는 ValueError 로 막힌다.
-        db_config 는 psycopg 인자다(host/port/dbname/user/password). 넘긴 항목만
-        DbService 의 기본값을 덮어쓴다 — 비밀번호 하나만 줘도 나머지는 기본값이 쓰인다.
+        use_db 는 DB 를 쓸지다. False 면 커넥션을 안 만들고 저장·검색·사전 단계가
+        ValueError 로 막힌다.
+
+        db_backend 는 어떻게 붙을지다.
+            "manager" — db-manager 의 저장 프로시저. 운영은 이쪽이다.
+                        db_manager 에 이미 만든 DBManager 를 넘기면 그걸 쓰고,
+                        안 넘기면 여기서 만들어 init() 한다.
+            "direct"  — 이 저장소가 SQL 을 직접 쓴다. 혼자 돌려볼 때.
+                        db_config 는 psycopg 인자다(host/port/dbname/user/password).
+                        넘긴 항목만 기본값을 덮어쓴다.
         """
         self.embedding_model_path = embedding_model_path
         self.reranker_model_path = reranker_model_path
@@ -91,19 +98,32 @@ class RagController:
             device=device,
             use_fp16=use_fp16,
         )
-        # DB 에 직접 붙는 건 이 저장소 안에서 돌려보기 위한 것이다. 운영에서는 DB 쪽이
-        # 만든 프로시저를 RagSystem 이 조합해 부르므로 ragmodul 이 커넥션을 들 이유가
-        # 없다. use_db=False 로 끄면 커넥션을 아예 안 만들고, DB 를 쓰는 단계는
-        # ValueError 로 막는다(조용히 None 을 돌려주면 원인을 못 찾는다).
+        # DB 를 어떻게 붙을지 고른다. 둘 다 같은 메서드를 제공하므로 아래 단계들은
+        # 무엇이 들어왔는지 모른다.
+        #   "manager" — db-manager 의 저장 프로시저를 부른다. 운영은 이쪽이다.
+        #               스키마가 바뀌어도 프로시저가 흡수한다.
+        #   "direct"  — 이 저장소가 SQL 을 직접 쓴다. 혼자 돌려볼 때.
+        # use_db=False 면 커넥션을 아예 안 만들고, DB 를 쓰는 단계는 ValueError 로
+        # 막는다(조용히 None 을 돌려주면 원인을 못 찾는다).
         #
         # sparse 차원은 하드코딩하지 않고 모델에게 묻는다(= 토크나이저 vocab 크기).
         # sql/schema.sql 의 SPARSEVEC(N) 과 이 값이 어긋나면 저장에서 실패한다.
         self._db = None
-        if use_db:
+        if use_db and db_backend == "manager":
+            from .service.db_manager_service import DbManagerService
+
+            self._db = DbManagerService(
+                manager=db_manager,
+                sparse_dim=self._embedder.sparse_dimension,
+            )
+        elif use_db and db_backend == "direct":
             self._db = DbService(
                 config=db_config,
                 sparse_dim=self._embedder.sparse_dimension,
             )
+        elif use_db:
+            raise ValueError(
+                f"모르는 db_backend: {db_backend!r} ('direct' 또는 'manager')")
         # LLM 설정을 안 준 사람은 LLM 스택을 안 깐 사람이다(ragmodul[llm] 은 선택
         # 의존성). import 를 여기 두는 건 그래서다 — 모듈 맨 위에 두면 검색만 쓰는
         # 사람이 ragmodul 을 import 조차 못 한다. 객체 자체는 만들어 둔다. 설정을
@@ -153,6 +173,15 @@ class RagController:
         self._require_db().save_document(document)
         logger.info("DB 저장 완료: %d개", len(document.children()))
         return len(document.children())
+
+    @property
+    def sparse_dimension(self) -> int:
+        """sparse 벡터 차원(= 토크나이저 vocab 크기).
+
+        DB 에 직접 넣는 쪽이 프로시저에 넘길 값이다 — 하드코딩하면 모델을 바꿨을 때
+        조용히 어긋난다(sql/schema.sql 의 SPARSEVEC(N) 과 같아야 한다).
+        """
+        return self._embedder.sparse_dimension
 
     #------------------------------------------------┌> 질의 검색
 
@@ -404,6 +433,14 @@ class RagController:
         return self.llm
 
     def close(self) -> None:
-        """만들어둔 연결을 정리한다. 프로세스 종료 시 한 번."""
+        """만들어둔 연결을 정리한다. 프로세스 종료 시 한 번.
+
+        LLM 을 먼저 닫는다. 둘 다 자기 이벤트 루프를 들고 있어서(LlmService 는
+        스레드별, DBManager 는 인스턴스별) 순서를 정해두지 않으면 어느 쪽이 먼저
+        닫히는지가 실행마다 달라진다. 서로 남의 루프를 안 쓰므로 순서 자체는
+        안전하지만, 로그가 뒤섞이지 않게 고정해둔다.
+        """
         if self.llm is not None:
             self.llm.close()
+        if self._db is not None:
+            self._db.close()
