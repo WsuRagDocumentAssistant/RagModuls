@@ -166,7 +166,7 @@ class LlmService:
     #------------------------------------------------┌> 답변 (async 본체)
 
     async def aanswer(self, query: str, contexts: list, provider: str | None = None,
-                      web_search: bool = True) -> str:
+                      web_search: bool = True, external: list | None = None) -> str:
         """검색된 맥락으로 질문에 답한다.
 
         contexts 는 rerank() 를 지난 RetrievedContext 목록이다. 출처(breadcrumb)를
@@ -179,17 +179,23 @@ class LlmService:
 
         web_search 기본이 켜짐이다. 맥락에 없는 것을 물으면 모델이 웹에서 찾아
         보완한다. 로컬은 지원하지 않아 무시된다(초안 모델이 로컬이면 자동으로 꺼진다).
+
+        external 은 유사도로 찾은 외부 API 목록이다. 맥락과 섞지 않고 별도 절로
+        내려보낸다 — 제목뿐이라 근거가 될 수 없는데 Context 에 끼면 모델이 사실처럼
+        인용한다. 맥락 예산(context_chars)에는 넣지 않는다. top_k=1 이라 한 줄이다.
         """
         prov = self._provider(provider)
         block, used = _format_contexts(contexts, prov.context_chars)
-        system, user = get_prompt("answer", context=block, query=query)
+        system, user = get_prompt("answer", context=block, query=query,
+                                  external=_format_external(external))
         text = await self.aask(user, provider, system=system, web_search=web_search)
         logger.info("[%s] 답변: 맥락 %d개(%d자) -> %d자",
                     provider or self.default, used, len(block), len(text))
         return text
 
     async def arefine(self, query: str, contexts: list, draft: str,
-                      provider: str | None = None, web_search: bool = True) -> str:
+                      provider: str | None = None, web_search: bool = True,
+                      external: list | None = None) -> str:
         """다른 모델이 만든 답변 초안을 Context 와 견주어 고친다.
 
         local_llm 이 초안을 만들고 사용자가 고른 모델이 다듬는 흐름에 쓴다.
@@ -210,7 +216,8 @@ class LlmService:
 
         prov = self._provider(provider)
         block, used = _format_contexts(contexts, prov.context_chars)
-        system, user = get_prompt("refine", context=block, query=query, draft=draft)
+        system, user = get_prompt("refine", context=block, query=query, draft=draft,
+                                  external=_format_external(external))
         text = await self.aask(user, provider, system=system, web_search=web_search)
         logger.info("[%s] 다듬기: 초안 %d자 + 맥락 %d개(%d자) -> %d자",
                     provider or self.default, len(draft), used, len(block), len(text))
@@ -218,7 +225,8 @@ class LlmService:
 
     async def arefine_all(self, query: str, contexts: list, draft: str,
                           providers: list[str], parallel: bool = True,
-                          web_search: bool = True) -> dict[str, str]:
+                          web_search: bool = True,
+                          external: list | None = None) -> dict[str, str]:
         """고른 모델들이 같은 초안을 각자 다듬는다. {provider: 다듬은 답변}.
 
         하나가 죽어도 나머지는 돌려준다 — 한도(429)나 키 없음으로 한쪽만 실패하는 게
@@ -246,7 +254,7 @@ class LlmService:
         if parallel:
             # return_exceptions 를 안 켜면 하나가 터질 때 나머지가 취소되고 예외만 올라온다
             results = await asyncio.gather(
-                *(self.arefine(query, contexts, draft, name, web_search)
+                *(self.arefine(query, contexts, draft, name, web_search, external)
                   for name in targets),
                 return_exceptions=True,
             )
@@ -255,7 +263,8 @@ class LlmService:
             for name in targets:
                 try:
                     results.append(
-                        await self.arefine(query, contexts, draft, name, web_search))
+                        await self.arefine(query, contexts, draft, name, web_search,
+                                           external))
                 except Exception as e:
                     results.append(e)
 
@@ -465,18 +474,21 @@ class LlmService:
     #------------------------------------------------┌> 동기 껍데기
 
     def answer(self, query: str, contexts: list, provider: str | None = None,
-               web_search: bool = True) -> str:
-        return _run(self.aanswer(query, contexts, provider, web_search))
+               web_search: bool = True, external: list | None = None) -> str:
+        return _run(self.aanswer(query, contexts, provider, web_search, external))
 
     def refine(self, query: str, contexts: list, draft: str,
-               provider: str | None = None, web_search: bool = True) -> str:
-        return _run(self.arefine(query, contexts, draft, provider, web_search))
+               provider: str | None = None, web_search: bool = True,
+               external: list | None = None) -> str:
+        return _run(self.arefine(query, contexts, draft, provider, web_search,
+                                 external))
 
     def refine_all(self, query: str, contexts: list, draft: str,
                    providers: list[str], parallel: bool = True,
-                   web_search: bool = True) -> dict[str, str]:
+                   web_search: bool = True,
+                   external: list | None = None) -> dict[str, str]:
         return _run(self.arefine_all(query, contexts, draft, providers, parallel,
-                                     web_search))
+                                     web_search, external))
 
     def merge(self, question: str, answers: list[str],
               provider: str | None = None) -> str:
@@ -705,6 +717,36 @@ def _format_contexts(contexts: list, max_chars: int | None = None) -> tuple[str,
         blocks.append(block)
         total += len(block)
     return "\n\n".join(blocks), len(blocks)
+
+
+def _format_external(refs: list | None) -> str:
+    """외부 데이터 목록을 프롬프트 끝에 붙일 절로 만든다. 없으면 빈 문자열.
+
+    빈 문자열을 돌려주는 게 중요하다. 제목만 있고 내용이 없는 '## 참고 가능한 외부
+    데이터' 가 남으면 모델이 그 빈칸을 설명하려 든다.
+
+    dict 목록을 받는다(search_api_data_vector 의 결과 그대로). 쓰는 키는 title 과
+    source 뿐이다 — url 은 넣지 않는다. 그 API 를 실제로 부르는 건 우리 쪽 일이고,
+    모델이 링크를 그대로 답변에 옮기면 사용자가 인증 없이 눌러 실패한다.
+    key 와 data 는 애초에 프로시저가 돌려주지 않는다(API 키가 새면 안 된다).
+    """
+    if not refs:
+        return ""
+
+    lines = []
+    for ref in refs:
+        if isinstance(ref, str):
+            lines.append(f"- {ref}")
+            continue
+        title = (ref.get("title") or "").strip()
+        if not title:
+            continue
+        source = (ref.get("source") or "").strip()
+        lines.append(f"- {title} ({source})" if source else f"- {title}")
+
+    if not lines:
+        return ""
+    return "\n\n## 참고 가능한 외부 데이터\n" + "\n".join(lines)
 
 
 def _extract(schema: type[BaseModel], text: str) -> BaseModel | None:

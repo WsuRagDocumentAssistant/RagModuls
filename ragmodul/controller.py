@@ -21,7 +21,8 @@ from .service.db_service import DbService
 from .service.embedded_service import EmbeddedService
 from .service.parser_service import parse
 from .service.reranker_service import DEFAULT_MAX_PER_PARENT, RerankerService
-from .util import DEFAULT_PACK_CHARS, expand_query, filter_vocab_pairs, pack_texts
+from .util import (DEFAULT_PACK_CHARS, expand_query, filter_vocab_pairs, pack_texts,
+                   to_plain_vector)
 
 logger = logging.getLogger(__name__)
 
@@ -174,6 +175,24 @@ class RagController:
         logger.info("DB 저장 완료: %d개", len(document.children()))
         return len(document.children())
 
+    def embed_texts(self, texts: list[str]) -> list[list[float]]:
+        """일반 텍스트를 dense 벡터로 만든다. 순서는 입력과 같다.
+
+        문서 청크가 아닌 것(외부 API 목록의 title·source 등)을 임베딩할 때 쓴다.
+        DB 에 바로 넣을 수 있게 numpy 가 아닌 list 로 돌려준다.
+
+        encode_documents 를 쓴다 — 저장되는 쪽이라 질의 접두사를 붙이면 안 된다.
+        찾을 때는 embed_query 의 dense 를 쓰면 짝이 맞는다.
+
+        sparse 는 내지 않는다. 이 벡터를 받는 api_data_vectors 는 embedding
+        vector(1024) 한 컬럼뿐이라 넣을 자리가 없다.
+        """
+        if not texts:
+            return []
+        vectors = self._embedder.encode_documents(texts)
+        logger.info("텍스트 임베딩: %d개 (dense)", len(texts))
+        return [to_plain_vector(v) for v in vectors]
+
     @property
     def sparse_dimension(self) -> int:
         """sparse 벡터 차원(= 토크나이저 vocab 크기).
@@ -255,23 +274,29 @@ class RagController:
     #------------------------------------------------┌> 답변 생성 (선택 의존성)
 
     def answer(self, query: str, contexts: list, provider: str | None = None,
-               web_search: bool = True) -> str:
+               web_search: bool = True, external: list | None = None) -> str:
         """검색된 맥락으로 답변을 만든다. rerank() 다음 단계다.
 
         web_search 기본이 켜짐이다 — 맥락에 없는 것을 물으면 모델이 웹에서 찾아
         보완한다. 로컬 provider 는 지원하지 않아 무시된다.
+
+        external 은 유사도로 찾은 외부 API 목록이다(search_api_data_vector 결과
+        그대로). 맥락과 섞지 않고 '## 참고 가능한 외부 데이터' 절로 따로 내려간다 —
+        제목뿐이라 근거가 못 되는데 Context 에 끼면 모델이 사실처럼 인용한다.
         """
         return self._require_llm().answer(query, contexts, provider=provider,
-                                          web_search=web_search)
+                                          web_search=web_search, external=external)
 
     async def aanswer(self, query: str, contexts: list, provider: str | None = None,
-                      web_search: bool = True) -> str:
+                      web_search: bool = True, external: list | None = None) -> str:
         """answer() 의 async 판. 이미 이벤트 루프 안이면 이쪽을 await 한다."""
         return await self._require_llm().aanswer(query, contexts, provider=provider,
-                                                 web_search=web_search)
+                                                 web_search=web_search,
+                                                 external=external)
 
     def refine(self, query: str, contexts: list, draft: str,
-               provider: str | None = None, web_search: bool = True) -> str:
+               provider: str | None = None, web_search: bool = True,
+               external: list | None = None) -> str:
         """다른 모델이 만든 답변 초안을 다듬는다. LLM 한 번.
 
         local_llm 이 초안을 만들고 사용자가 고른 모델이 다듬는 단계다. 고른 모델이
@@ -284,18 +309,21 @@ class RagController:
         보완한다.
         """
         return self._require_llm().refine(query, contexts, draft, provider=provider,
-                                          web_search=web_search)
+                                          web_search=web_search, external=external)
 
     async def arefine(self, query: str, contexts: list, draft: str,
-                      provider: str | None = None, web_search: bool = True) -> str:
+                      provider: str | None = None, web_search: bool = True,
+                      external: list | None = None) -> str:
         """refine() 의 async 판."""
         return await self._require_llm().arefine(query, contexts, draft,
                                                  provider=provider,
-                                                 web_search=web_search)
+                                                 web_search=web_search,
+                                                 external=external)
 
     def refine_all(self, query: str, contexts: list, draft: str,
                    providers: list[str], parallel: bool = True,
-                   web_search: bool = True) -> dict[str, str]:
+                   web_search: bool = True,
+                   external: list | None = None) -> dict[str, str]:
         """고른 모델들이 같은 초안을 각자 다듬는다. {provider: 다듬은 답변}.
 
         사용자가 한 질의에 모델을 여러 개 골랐을 때 쓰는 단계다. 목록 길이만큼
@@ -308,14 +336,16 @@ class RagController:
         대조하면 무엇이 빠졌는지 알 수 있다.
         """
         return self._require_llm().refine_all(query, contexts, draft, providers,
-                                              parallel, web_search)
+                                              parallel, web_search, external)
 
     async def arefine_all(self, query: str, contexts: list, draft: str,
                           providers: list[str], parallel: bool = True,
-                          web_search: bool = True) -> dict[str, str]:
+                          web_search: bool = True,
+                          external: list | None = None) -> dict[str, str]:
         """refine_all() 의 async 판."""
         return await self._require_llm().arefine_all(query, contexts, draft,
-                                                     providers, parallel, web_search)
+                                                     providers, parallel, web_search,
+                                                     external)
 
     def merge(self, question: str, answers: list[str],
               provider: str | None = None) -> str:
