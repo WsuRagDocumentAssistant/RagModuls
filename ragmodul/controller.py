@@ -20,7 +20,8 @@ from .service.chunker_service import chunk
 from .service.db_service import DbService
 from .service.embedded_service import EmbeddedService
 from .service.parser_service import parse
-from .service.reranker_service import DEFAULT_MAX_PER_PARENT, RerankerService
+from .service.reranker_service import (DEFAULT_MAX_PER_PARENT, DEFAULT_MIN_SCORE,
+                                       RerankerService)
 from .util import (DEFAULT_PACK_CHARS, expand_query, filter_vocab_pairs, pack_texts,
                    to_plain_vector)
 
@@ -260,16 +261,25 @@ class RagController:
         return contexts[:limit] if limit else contexts
 
     def rerank(self, query: str, contexts: list, top_k: int = 3,
-               max_per_parent: int | None = DEFAULT_MAX_PER_PARENT) -> list:
+               max_per_parent: int | None = DEFAULT_MAX_PER_PARENT,
+               min_score: float | None = DEFAULT_MIN_SCORE) -> list:
         """맥락을 재정렬해 상위 top_k 를 돌려준다.
 
         max_per_parent 는 한 부모의 조각을 최종 자리에 몇 개까지 담을지다. 점수는
         전부 계산하고 고를 때만 제한한다 — 리랭크 전에 자르면 정답이 사라진다(실측).
         None 이면 제한하지 않는다.
+
+        min_score 아래는 버린다. 문서와 무관한 질의여서 전부 걸리면 빈 목록이
+        나오므로, 부르는 쪽은 맥락 없이 답하는 경우를 처리해야 한다.
         """
-        logger.info("리랭크: %d개 -> top_k=%d (부모당 최대 %s)",
-                    len(contexts), top_k, max_per_parent or "제한없음")
-        return self._reranker.rerank(query, contexts, top_k, max_per_parent)
+        logger.info("리랭크: %d개 -> top_k=%d (부모당 최대 %s, 최소 점수 %s)",
+                    len(contexts), top_k, max_per_parent or "제한없음",
+                    min_score if min_score is not None else "없음")
+        ordered = self._reranker.rerank(query, contexts, top_k, max_per_parent,
+                                        min_score)
+        if not ordered and contexts:
+            logger.info("남은 맥락 없음 — 문서와 무관한 질의로 본다")
+        return ordered
 
     #------------------------------------------------┌> 답변 생성 (선택 의존성)
 

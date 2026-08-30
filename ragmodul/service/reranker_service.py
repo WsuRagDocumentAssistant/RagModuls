@@ -32,6 +32,22 @@ logger = logging.getLogger(__name__)
 # 2 인 이유: 한 섹션 안에 답이 두 군데 흩어진 경우를 살리면서 독점만 막는다.
 DEFAULT_MAX_PER_PARENT = 2
 
+# 최종 자리에 담을 최소 점수. 이보다 낮으면 버린다.
+#
+# 왜 필요한가: 검색은 늘 top_k 개를 돌려준다. 문서와 아무 상관 없는 질의("오늘 날씨")
+# 가 와도 조각 40개가 잡히고, 그게 그대로 LLM 에 실려 나간다(실측 1,944자). 근거가
+# 되지도 못하면서 토큰만 쓰고, 모델이 억지로 엮으면 엉뚱한 답이 된다.
+#
+# 0.01 인 근거(실측, 같은 문서 대상):
+#   관련 있는 질의 셋의 최고점   0.341  0.685  0.986
+#   관련 없는 질의 셋의 최고점   0.000046  0.000445  0.000193
+# 무관한 쪽 최고값이 0.000445 다. 0.01 은 그 22배 위라 여유가 있다. 0.001 로 잡으면
+# 2.2배뿐이라 문서가 바뀌면 무관한 맥락이 새어 들어온다. 반대로 0.1 은 관련 있는
+# 질의에서 13개가 4개로 깎여 과하다.
+#
+# 점수는 sigmoid 라 0~1 이다. 모델을 바꾸면 분포가 달라지므로 다시 재야 한다.
+DEFAULT_MIN_SCORE = 0.01
+
 
 def _limit_per_parent(ordered: list, top_k: int, max_per_parent: int) -> list:
     """점수순 목록에서 부모당 개수를 제한해 top_k 를 고른다.
@@ -99,7 +115,8 @@ class RerankerService:
         logger.info("리랭커 로드 완료: %s (device=%s, fp16=%s)", model_path, self.device, self.use_fp16)
 
     def rerank(self, query: str, contexts: list, top_k: int,
-               max_per_parent: int | None = DEFAULT_MAX_PER_PARENT) -> list:
+               max_per_parent: int | None = DEFAULT_MAX_PER_PARENT,
+               min_score: float | None = DEFAULT_MIN_SCORE) -> list:
         """contexts 를 재정렬해 상위 top_k 를 돌려준다.
 
         contexts 는 rerank_text(읽기)와 rerank_score(쓰기)를 가진 객체여야 한다
@@ -112,6 +129,11 @@ class RerankerService:
 
         max_per_parent 는 최종 자리에 한 부모의 조각을 몇 개까지 담을지다. None 이면
         제한하지 않는다.
+
+        min_score 아래는 버린다. 전부 걸리면 빈 목록을 돌려준다 — 문서와 무관한
+        질의라는 뜻이고, 그때는 맥락 없이 답하는 게 맞다. 억지로 몇 개 남겨두면
+        모델이 상관없는 글로 답을 엮는다. None 이면 거르지 않는다(점수만 매긴다).
+        점수는 걸러진 것에도 매겨져 있으므로 부르는 쪽에서 확인할 수 있다.
         """
         if not contexts:
             return contexts
@@ -125,6 +147,17 @@ class RerankerService:
             context.rerank_score = float(score)
 
         ordered = sorted(contexts, key=lambda c: c.rerank_score, reverse=True)
+
+        if min_score is not None:
+            kept = [c for c in ordered if c.rerank_score >= min_score]
+            if len(kept) != len(ordered):
+                top = ordered[0].rerank_score if ordered else 0.0
+                logger.info("점수 미달 버림: %d개 중 %d개 남음 (기준 %.3f, 최고 %.6f)",
+                            len(ordered), len(kept), min_score, top)
+            ordered = kept
+            if not ordered:
+                return []
+
         if max_per_parent is None:
             return ordered[:top_k]
         return _limit_per_parent(ordered, top_k, max_per_parent)
