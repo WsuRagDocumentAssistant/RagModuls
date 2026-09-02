@@ -184,6 +184,8 @@ class LlmService:
         내려보낸다 — 제목뿐이라 근거가 될 수 없는데 Context 에 끼면 모델이 사실처럼
         인용한다. 맥락 예산(context_chars)에는 넣지 않는다. top_k=1 이라 한 줄이다.
         """
+    
+        logger.info(f"질의 외부 데이터 {external}")
         prov = self._provider(provider)
         block, used = _format_contexts(contexts, prov.context_chars)
         system, user = get_prompt("answer", context=block, query=query,
