@@ -284,7 +284,8 @@ class RagController:
     #------------------------------------------------┌> 답변 생성 (선택 의존성)
 
     def answer(self, query: str, contexts: list, provider: str | None = None,
-               web_search: bool = True, external: list | None = None) -> str:
+               web_search: bool = True, external: list | None = None,
+               history: list | None = None) -> str:
         """검색된 맥락으로 답변을 만든다. rerank() 다음 단계다.
 
         web_search 기본이 켜짐이다 — 맥락에 없는 것을 물으면 모델이 웹에서 찾아
@@ -293,20 +294,26 @@ class RagController:
         external 은 유사도로 찾은 외부 API 목록이다(search_api_data_vector 결과
         그대로). 맥락과 섞지 않고 '## 참고 가능한 외부 데이터' 절로 따로 내려간다 —
         제목뿐이라 근거가 못 되는데 Context 에 끼면 모델이 사실처럼 인용한다.
+
+        history 는 같은 세션의 앞선 대화다. {user_query, ai_response} 목록이면
+        되고(DB 의 세션 기록이 그 모양이다), '## 이전 대화' 절로 따로 내려간다.
+        "그거", "방금 말한 거" 를 푸는 단서일 뿐 근거는 아니다.
         """
         return self._require_llm().answer(query, contexts, provider=provider,
-                                          web_search=web_search, external=external)
+                                          web_search=web_search, external=external,
+                                          history=history)
 
     async def aanswer(self, query: str, contexts: list, provider: str | None = None,
-                      web_search: bool = True, external: list | None = None) -> str:
+                      web_search: bool = True, external: list | None = None,
+                      history: list | None = None) -> str:
         """answer() 의 async 판. 이미 이벤트 루프 안이면 이쪽을 await 한다."""
         return await self._require_llm().aanswer(query, contexts, provider=provider,
                                                  web_search=web_search,
-                                                 external=external)
+                                                 external=external, history=history)
 
     def refine(self, query: str, contexts: list, draft: str,
                provider: str | None = None, web_search: bool = True,
-               external: list | None = None) -> str:
+               external: list | None = None, history: list | None = None) -> str:
         """다른 모델이 만든 답변 초안을 다듬는다. LLM 한 번.
 
         local_llm 이 초안을 만들고 사용자가 고른 모델이 다듬는 단계다. 고른 모델이
@@ -317,23 +324,29 @@ class RagController:
 
         web_search 기본이 켜짐이다. 초안을 만든 로컬 모델은 바깥을 못 보므로 여기서
         보완한다.
+
+        history 는 answer() 와 같다. 초안을 만들 때 준 것과 같은 대화를 줘야, 대명사를
+        초안이 제대로 짚었는지 다듬는 쪽이 판단할 수 있다.
         """
         return self._require_llm().refine(query, contexts, draft, provider=provider,
-                                          web_search=web_search, external=external)
+                                          web_search=web_search, external=external,
+                                          history=history)
 
     async def arefine(self, query: str, contexts: list, draft: str,
                       provider: str | None = None, web_search: bool = True,
-                      external: list | None = None) -> str:
+                      external: list | None = None,
+                      history: list | None = None) -> str:
         """refine() 의 async 판."""
         return await self._require_llm().arefine(query, contexts, draft,
                                                  provider=provider,
                                                  web_search=web_search,
-                                                 external=external)
+                                                 external=external, history=history)
 
     def refine_all(self, query: str, contexts: list, draft: str,
                    providers: list[str], parallel: bool = True,
                    web_search: bool = True,
-                   external: list | None = None) -> dict[str, str]:
+                   external: list | None = None,
+                   history: list | None = None) -> dict[str, str]:
         """고른 모델들이 같은 초안을 각자 다듬는다. {provider: 다듬은 답변}.
 
         사용자가 한 질의에 모델을 여러 개 골랐을 때 쓰는 단계다. 목록 길이만큼
@@ -346,16 +359,18 @@ class RagController:
         대조하면 무엇이 빠졌는지 알 수 있다.
         """
         return self._require_llm().refine_all(query, contexts, draft, providers,
-                                              parallel, web_search, external)
+                                              parallel, web_search, external,
+                                              history)
 
     async def arefine_all(self, query: str, contexts: list, draft: str,
                           providers: list[str], parallel: bool = True,
                           web_search: bool = True,
-                          external: list | None = None) -> dict[str, str]:
+                          external: list | None = None,
+                          history: list | None = None) -> dict[str, str]:
         """refine_all() 의 async 판."""
         return await self._require_llm().arefine_all(query, contexts, draft,
                                                      providers, parallel, web_search,
-                                                     external)
+                                                     external, history)
 
     def merge(self, question: str, answers: list[str],
               provider: str | None = None) -> str:

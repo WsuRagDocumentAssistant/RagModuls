@@ -68,6 +68,11 @@ LOCAL_MAX_TOKENS = 2048
 # 게이트웨이가 413 Payload Too Large 로 잘랐다.
 LOCAL_CONTEXT_CHARS = 6500
 
+# 이전 대화에 쓸 글자 상한. 넘치면 오래된 차례를 버린다.
+# 1,500자면 두세 차례가 들어간다. 대명사("그거", "방금 말한 거")가 가리키는 건
+# 거의 직전 차례라 그 정도로 충분하다.
+HISTORY_CHARS = 1500
+
 # temperature 를 보내면 400 이 나는 provider. claude 는 ai-rag-comm 이 경고 후 무시하고,
 # gemini/local 은 정상으로 받는다. gpt 만 모델이 거부한다 —
 # "does not support 0.0 with this model. Only the default (1) value is supported".
@@ -166,7 +171,8 @@ class LlmService:
     #------------------------------------------------┌> 답변 (async 본체)
 
     async def aanswer(self, query: str, contexts: list, provider: str | None = None,
-                      web_search: bool = True, external: list | None = None) -> str:
+                      web_search: bool = True, external: list | None = None,
+                      history: list | None = None) -> str:
         """검색된 맥락으로 질문에 답한다.
 
         contexts 는 rerank() 를 지난 RetrievedContext 목록이다. 출처(breadcrumb)를
@@ -183,13 +189,19 @@ class LlmService:
         external 은 유사도로 찾은 외부 API 목록이다. 맥락과 섞지 않고 별도 절로
         내려보낸다 — 제목뿐이라 근거가 될 수 없는데 Context 에 끼면 모델이 사실처럼
         인용한다. 맥락 예산(context_chars)에는 넣지 않는다. top_k=1 이라 한 줄이다.
+
+        history 는 같은 세션의 앞선 대화다. "그거", "방금 말한 거" 처럼 질의만으로는
+        무엇을 묻는지 알 수 없을 때 그걸 푸는 데 쓴다. 근거가 아니라 해석 단서다.
+        실은 만큼 맥락 예산에서 뺀다 — 로컬은 6,500자를 이미 맥락에 다 쓰고 있어서
+        그 위에 얹으면 그대로 넘친다.
         """
-    
+
         logger.info(f"질의 외부 데이터 {external}")
         prov = self._provider(provider)
+        hist = _format_history(history)
         block, used = _format_contexts(contexts, prov.context_chars)
         system, user = get_prompt("answer", context=block, query=query,
-                                  external=_format_external(external))
+                                  external=_format_external(external), history=hist)
         text = await self.aask(user, provider, system=system, web_search=web_search)
         logger.info("[%s] 답변: 맥락 %d개(%d자) -> %d자",
                     provider or self.default, used, len(block), len(text))
@@ -197,7 +209,8 @@ class LlmService:
 
     async def arefine(self, query: str, contexts: list, draft: str,
                       provider: str | None = None, web_search: bool = True,
-                      external: list | None = None) -> str:
+                      external: list | None = None,
+                      history: list | None = None) -> str:
         """다른 모델이 만든 답변 초안을 Context 와 견주어 고친다.
 
         local_llm 이 초안을 만들고 사용자가 고른 모델이 다듬는 흐름에 쓴다.
@@ -211,15 +224,19 @@ class LlmService:
 
         web_search 기본이 켜짐이다. 초안이 로컬 모델이라 바깥을 못 보므로, 다듬는
         쪽에서 웹을 뒤져 보완한다.
+
+        history 는 aanswer 와 같다. 초안을 만든 모델이 본 것과 같은 대화를 줘야,
+        대명사를 초안이 제대로 짚었는지 다듬는 쪽이 판단할 수 있다.
         """
         if not draft or not draft.strip():
             logger.warning("초안이 비어 있다. 다듬기를 건너뛴다.")
             return ""
 
         prov = self._provider(provider)
+        hist = _format_history(history)
         block, used = _format_contexts(contexts, prov.context_chars)
         system, user = get_prompt("refine", context=block, query=query, draft=draft,
-                                  external=_format_external(external))
+                                  external=_format_external(external), history=hist)
         text = await self.aask(user, provider, system=system, web_search=web_search)
         logger.info("[%s] 다듬기: 초안 %d자 + 맥락 %d개(%d자) -> %d자",
                     provider or self.default, len(draft), used, len(block), len(text))
@@ -228,7 +245,8 @@ class LlmService:
     async def arefine_all(self, query: str, contexts: list, draft: str,
                           providers: list[str], parallel: bool = True,
                           web_search: bool = True,
-                          external: list | None = None) -> dict[str, str]:
+                          external: list | None = None,
+                          history: list | None = None) -> dict[str, str]:
         """고른 모델들이 같은 초안을 각자 다듬는다. {provider: 다듬은 답변}.
 
         하나가 죽어도 나머지는 돌려준다 — 한도(429)나 키 없음으로 한쪽만 실패하는 게
@@ -256,7 +274,8 @@ class LlmService:
         if parallel:
             # return_exceptions 를 안 켜면 하나가 터질 때 나머지가 취소되고 예외만 올라온다
             results = await asyncio.gather(
-                *(self.arefine(query, contexts, draft, name, web_search, external)
+                *(self.arefine(query, contexts, draft, name, web_search, external,
+                               history)
                   for name in targets),
                 return_exceptions=True,
             )
@@ -266,7 +285,7 @@ class LlmService:
                 try:
                     results.append(
                         await self.arefine(query, contexts, draft, name, web_search,
-                                           external))
+                                           external, history))
                 except Exception as e:
                     results.append(e)
 
@@ -476,21 +495,24 @@ class LlmService:
     #------------------------------------------------┌> 동기 껍데기
 
     def answer(self, query: str, contexts: list, provider: str | None = None,
-               web_search: bool = True, external: list | None = None) -> str:
-        return _run(self.aanswer(query, contexts, provider, web_search, external))
+               web_search: bool = True, external: list | None = None,
+               history: list | None = None) -> str:
+        return _run(self.aanswer(query, contexts, provider, web_search, external,
+                                 history))
 
     def refine(self, query: str, contexts: list, draft: str,
                provider: str | None = None, web_search: bool = True,
-               external: list | None = None) -> str:
+               external: list | None = None, history: list | None = None) -> str:
         return _run(self.arefine(query, contexts, draft, provider, web_search,
-                                 external))
+                                 external, history))
 
     def refine_all(self, query: str, contexts: list, draft: str,
                    providers: list[str], parallel: bool = True,
                    web_search: bool = True,
-                   external: list | None = None) -> dict[str, str]:
+                   external: list | None = None,
+                   history: list | None = None) -> dict[str, str]:
         return _run(self.arefine_all(query, contexts, draft, providers, parallel,
-                                     web_search, external))
+                                     web_search, external, history))
 
     def merge(self, question: str, answers: list[str],
               provider: str | None = None) -> str:
@@ -719,6 +741,56 @@ def _format_contexts(contexts: list, max_chars: int | None = None) -> tuple[str,
         blocks.append(block)
         total += len(block)
     return "\n\n".join(blocks), len(blocks)
+
+
+def _format_history(history: list | None, max_chars: int = HISTORY_CHARS) -> str:
+    """이전 대화를 프롬프트에 붙일 절로 만든다. 없으면 빈 문자열.
+
+    받는 모양은 두 가지다. DB 의 세션 기록이 {user_query, ai_response} 로 오고
+    (get_recent_messages 가 그 모양이다), 직접 만들 때는 {role, content} 가 편하다.
+    둘 다 받는다.
+
+    최근 것부터 담는다. 넘치면 오래된 쪽을 버린다 — 대명사가 가리키는 건 거의
+    직전 차례이고, 오래된 차례를 살리고 직전을 버리면 있으나 마나다.
+    """
+    if not history:
+        return ""
+
+    turns: list[str] = []
+    total = 0
+    for item in reversed(history):              # 최근 것부터
+        if isinstance(item, dict):
+            question = (item.get("user_query") or item.get("question") or "").strip()
+            answer = (item.get("ai_response") or item.get("answer") or "").strip()
+            if not question and not answer:     # {role, content} 모양
+                role = (item.get("role") or "").strip()
+                content = (item.get("content") or "").strip()
+                if not content:
+                    continue
+                block = f"{'사용자' if role == 'user' else 'AI'}: {content}"
+            else:
+                lines = []
+                if question:
+                    lines.append(f"사용자: {question}")
+                if answer:
+                    lines.append(f"AI: {answer}")
+                block = "\n".join(lines)
+        else:
+            block = str(item)
+
+        if not block.strip():
+            continue
+        if turns and total + len(block) > max_chars:
+            logger.info("이전 대화 자름: %d차례 중 %d차례만 (%d자)",
+                        len(history), len(turns), total)
+            break
+        turns.append(block)
+        total += len(block)
+
+    if not turns:
+        return ""
+    turns.reverse()                             # 다시 시간순으로. 맨 아래가 최근
+    return "\n\n## 이전 대화\n" + "\n\n".join(turns)
 
 
 def _format_external(refs: list | None) -> str:
