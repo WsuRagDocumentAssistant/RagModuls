@@ -172,7 +172,8 @@ class LlmService:
 
     async def aanswer(self, query: str, contexts: list, provider: str | None = None,
                       web_search: bool = True, external: list | None = None,
-                      history: list | None = None) -> str:
+                      history: list | None = None,
+                      summary: str | None = None) -> str:
         """검색된 맥락으로 질문에 답한다.
 
         contexts 는 rerank() 를 지난 RetrievedContext 목록이다. 출처(breadcrumb)를
@@ -192,8 +193,10 @@ class LlmService:
 
         history 는 같은 세션의 앞선 대화다. "그거", "방금 말한 거" 처럼 질의만으로는
         무엇을 묻는지 알 수 없을 때 그걸 푸는 데 쓴다. 근거가 아니라 해석 단서다.
-        실은 만큼 맥락 예산에서 뺀다 — 로컬은 6,500자를 이미 맥락에 다 쓰고 있어서
-        그 위에 얹으면 그대로 넘친다.
+
+        summary 는 창 밖으로 밀려난 대화의 요약이다(asummarize_session 이 만든다).
+        history 에 섞지 않고 별도 절로 내려보낸다 — 요약은 차례가 아니라서 섞으면
+        모델이 대화 한 줄로 읽는다.
         """
 
         logger.info(f"질의 외부 데이터 {external}")
@@ -201,7 +204,8 @@ class LlmService:
         hist = _format_history(history)
         block, used = _format_contexts(contexts, prov.context_chars)
         system, user = get_prompt("answer", context=block, query=query,
-                                  external=_format_external(external), history=hist)
+                                  external=_format_external(external), history=hist,
+                                  summary=_format_summary(summary))
         text = await self.aask(user, provider, system=system, web_search=web_search)
         logger.info("[%s] 답변: 맥락 %d개(%d자) -> %d자",
                     provider or self.default, used, len(block), len(text))
@@ -210,7 +214,8 @@ class LlmService:
     async def arefine(self, query: str, contexts: list, draft: str,
                       provider: str | None = None, web_search: bool = True,
                       external: list | None = None,
-                      history: list | None = None) -> str:
+                      history: list | None = None,
+                      summary: str | None = None) -> str:
         """다른 모델이 만든 답변 초안을 Context 와 견주어 고친다.
 
         local_llm 이 초안을 만들고 사용자가 고른 모델이 다듬는 흐름에 쓴다.
@@ -225,8 +230,8 @@ class LlmService:
         web_search 기본이 켜짐이다. 초안이 로컬 모델이라 바깥을 못 보므로, 다듬는
         쪽에서 웹을 뒤져 보완한다.
 
-        history 는 aanswer 와 같다. 초안을 만든 모델이 본 것과 같은 대화를 줘야,
-        대명사를 초안이 제대로 짚었는지 다듬는 쪽이 판단할 수 있다.
+        history 와 summary 는 aanswer 와 같다. 초안을 만든 모델이 본 것과 같은 대화를
+        줘야, 대명사와 생략된 대상을 초안이 제대로 짚었는지 다듬는 쪽이 판단할 수 있다.
         """
         if not draft or not draft.strip():
             logger.warning("초안이 비어 있다. 다듬기를 건너뛴다.")
@@ -236,7 +241,8 @@ class LlmService:
         hist = _format_history(history)
         block, used = _format_contexts(contexts, prov.context_chars)
         system, user = get_prompt("refine", context=block, query=query, draft=draft,
-                                  external=_format_external(external), history=hist)
+                                  external=_format_external(external), history=hist,
+                                  summary=_format_summary(summary))
         text = await self.aask(user, provider, system=system, web_search=web_search)
         logger.info("[%s] 다듬기: 초안 %d자 + 맥락 %d개(%d자) -> %d자",
                     provider or self.default, len(draft), used, len(block), len(text))
@@ -246,7 +252,8 @@ class LlmService:
                           providers: list[str], parallel: bool = True,
                           web_search: bool = True,
                           external: list | None = None,
-                          history: list | None = None) -> dict[str, str]:
+                          history: list | None = None,
+                          summary: str | None = None) -> dict[str, str]:
         """고른 모델들이 같은 초안을 각자 다듬는다. {provider: 다듬은 답변}.
 
         하나가 죽어도 나머지는 돌려준다 — 한도(429)나 키 없음으로 한쪽만 실패하는 게
@@ -275,7 +282,7 @@ class LlmService:
             # return_exceptions 를 안 켜면 하나가 터질 때 나머지가 취소되고 예외만 올라온다
             results = await asyncio.gather(
                 *(self.arefine(query, contexts, draft, name, web_search, external,
-                               history)
+                               history, summary)
                   for name in targets),
                 return_exceptions=True,
             )
@@ -285,7 +292,7 @@ class LlmService:
                 try:
                     results.append(
                         await self.arefine(query, contexts, draft, name, web_search,
-                                           external, history))
+                                           external, history, summary))
                 except Exception as e:
                     results.append(e)
 
@@ -323,6 +330,47 @@ class LlmService:
         text = await self.aask(user, provider, system=system)
         logger.info("[%s] 병합: %s -> %d자", provider or self.default,
                     " + ".join(f"{len(a):,}자" for a in answers), len(text))
+        return text
+
+    async def asummarize_session(self, previous_summary: str, dropped_turns: list[dict],
+                                 provider: str | None = None) -> str:
+        """창 밖으로 밀려난 대화를 요약에 눌러 담는다. 갱신된 요약을 돌려준다.
+
+        _format_history 가 HISTORY_CHARS 를 넘으면 오래된 차례부터 버린다. 버려진
+        차례에만 있던 고유명사를 여기서 붙든다 — '2026년 우송대 취업률' 을 1턴에
+        묻고 9턴에서 '그럼 작년은?' 이라고 하면, 요약이 없을 때 무엇의 작년인지
+        알 수 없다.
+
+        누적 갱신이다. 전체 대화를 다시 읽지 않고 '기존 요약 + 새로 밀려난 차례' 만
+        넣는다. 프롬프트가 짧게 유지되고, 오래된 고유명사가 요약 안에서 계속 살아남는다.
+
+        수치는 담지 않는다(프롬프트가 버리게 되어 있다). RAG 라서 필요해지면 검색이
+        문서에서 다시 가져온다. 요약이 지켜야 하는 건 '무엇에 대해 이야기하던 중인가'
+        뿐이다.
+
+        구조화 출력을 쓰지 않는다. 세 문장짜리 평문 한 덩이라 스키마로 감쌀 이득이
+        없다. 웹서치도 안 쓴다 — 있던 대화를 줄이는 일이라 바깥을 볼 이유가 없고,
+        켜면 없던 내용이 섞여 들어온다.
+        """
+        turns = _turn_blocks(dropped_turns)
+        if not turns:
+            logger.info("밀려난 차례가 없다. 기존 요약을 그대로 둔다.")
+            return previous_summary or ""
+
+        blocks = "\n\n".join(f"<차례{i}>\n{t}\n</차례{i}>"
+                             for i, t in enumerate(turns, 1))
+        system, user = get_prompt("session_summary",
+                                  summary=(previous_summary or "").strip() or "(없음)",
+                                  conversations=blocks)
+        text = await self.aask(user, provider, system=system)
+        text = text.strip()
+        if not text:
+            # 요약을 못 만들었다고 기존 것을 버리면 오래된 고유명사가 통째로 사라진다.
+            logger.warning("세션 요약이 비어 있다. 기존 요약을 유지한다.")
+            return previous_summary or ""
+        logger.info("[%s] 세션 요약: %d차례 + 기존 %d자 -> %d자",
+                    provider or self.default, len(turns),
+                    len(previous_summary or ""), len(text))
         return text
 
     #------------------------------------------------┌> 축약어 사전 (async 본체)
@@ -496,23 +544,29 @@ class LlmService:
 
     def answer(self, query: str, contexts: list, provider: str | None = None,
                web_search: bool = True, external: list | None = None,
-               history: list | None = None) -> str:
+               history: list | None = None, summary: str | None = None) -> str:
         return _run(self.aanswer(query, contexts, provider, web_search, external,
-                                 history))
+                                 history, summary))
 
     def refine(self, query: str, contexts: list, draft: str,
                provider: str | None = None, web_search: bool = True,
-               external: list | None = None, history: list | None = None) -> str:
+               external: list | None = None, history: list | None = None,
+               summary: str | None = None) -> str:
         return _run(self.arefine(query, contexts, draft, provider, web_search,
-                                 external, history))
+                                 external, history, summary))
 
     def refine_all(self, query: str, contexts: list, draft: str,
                    providers: list[str], parallel: bool = True,
                    web_search: bool = True,
                    external: list | None = None,
-                   history: list | None = None) -> dict[str, str]:
+                   history: list | None = None,
+                   summary: str | None = None) -> dict[str, str]:
         return _run(self.arefine_all(query, contexts, draft, providers, parallel,
-                                     web_search, external, history))
+                                     web_search, external, history, summary))
+
+    def summarize_session(self, previous_summary: str, dropped_turns: list[dict],
+                          provider: str | None = None) -> str:
+        return _run(self.asummarize_session(previous_summary, dropped_turns, provider))
 
     def merge(self, question: str, answers: list[str],
               provider: str | None = None) -> str:
@@ -743,15 +797,58 @@ def _format_contexts(contexts: list, max_chars: int | None = None) -> tuple[str,
     return "\n\n".join(blocks), len(blocks)
 
 
-def _format_history(history: list | None, max_chars: int = HISTORY_CHARS) -> str:
-    """이전 대화를 프롬프트에 붙일 절로 만든다. 없으면 빈 문자열.
+def _format_summary(summary: str | None) -> str:
+    """세션 요약을 프롬프트에 붙일 절로 만든다. 없으면 빈 문자열.
+
+    Context 와 나눠 싣는다. 요약은 해석 단서일 뿐 근거가 아니어서, 섞이면 모델이
+    수치 없는 요약 문장을 사실처럼 인용한다(external 을 맥락과 나눈 것과 같은 이유).
+    """
+    if not summary or not summary.strip():
+        return ""
+    return f"\n\n## 이전 대화 요약\n{summary.strip()}"
+
+
+def _turn_text(item) -> str:
+    """대화 한 차례를 '사용자: ... / AI: ...' 평문으로 만든다. 빈 차례면 빈 문자열.
 
     받는 모양은 두 가지다. DB 의 세션 기록이 {user_query, ai_response} 로 오고
     (get_recent_messages 가 그 모양이다), 직접 만들 때는 {role, content} 가 편하다.
     둘 다 받는다.
 
+    _format_history 와 asummarize_session 이 같은 목록을 받으므로 여기서 한 번만
+    해석한다 — 둘이 따로 파싱하면 한쪽만 고쳐서 어긋난다.
+    """
+    if not isinstance(item, dict):
+        return str(item).strip()
+
+    question = (item.get("user_query") or item.get("question") or "").strip()
+    answer = (item.get("ai_response") or item.get("answer") or "").strip()
+    if not question and not answer:             # {role, content} 모양
+        content = (item.get("content") or "").strip()
+        if not content:
+            return ""
+        role = (item.get("role") or "").strip()
+        return f"{'사용자' if role == 'user' else 'AI'}: {content}"
+
+    lines = []
+    if question:
+        lines.append(f"사용자: {question}")
+    if answer:
+        lines.append(f"AI: {answer}")
+    return "\n".join(lines)
+
+
+def _turn_blocks(turns: list | None) -> list[str]:
+    """차례 목록을 평문 목록으로. 빈 것은 버린다."""
+    return [text for text in (_turn_text(item) for item in (turns or [])) if text]
+
+
+def _format_history(history: list | None, max_chars: int = HISTORY_CHARS) -> str:
+    """이전 대화를 프롬프트에 붙일 절로 만든다. 없으면 빈 문자열.
+
     최근 것부터 담는다. 넘치면 오래된 쪽을 버린다 — 대명사가 가리키는 건 거의
     직전 차례이고, 오래된 차례를 살리고 직전을 버리면 있으나 마나다.
+    밀려난 차례는 asummarize_session 이 요약으로 붙든다.
     """
     if not history:
         return ""
@@ -759,26 +856,8 @@ def _format_history(history: list | None, max_chars: int = HISTORY_CHARS) -> str
     turns: list[str] = []
     total = 0
     for item in reversed(history):              # 최근 것부터
-        if isinstance(item, dict):
-            question = (item.get("user_query") or item.get("question") or "").strip()
-            answer = (item.get("ai_response") or item.get("answer") or "").strip()
-            if not question and not answer:     # {role, content} 모양
-                role = (item.get("role") or "").strip()
-                content = (item.get("content") or "").strip()
-                if not content:
-                    continue
-                block = f"{'사용자' if role == 'user' else 'AI'}: {content}"
-            else:
-                lines = []
-                if question:
-                    lines.append(f"사용자: {question}")
-                if answer:
-                    lines.append(f"AI: {answer}")
-                block = "\n".join(lines)
-        else:
-            block = str(item)
-
-        if not block.strip():
+        block = _turn_text(item)
+        if not block:
             continue
         if turns and total + len(block) > max_chars:
             logger.info("이전 대화 자름: %d차례 중 %d차례만 (%d자)",

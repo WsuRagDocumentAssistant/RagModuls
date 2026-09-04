@@ -285,7 +285,7 @@ class RagController:
 
     def answer(self, query: str, contexts: list, provider: str | None = None,
                web_search: bool = True, external: list | None = None,
-               history: list | None = None) -> str:
+               history: list | None = None, summary: str | None = None) -> str:
         """검색된 맥락으로 답변을 만든다. rerank() 다음 단계다.
 
         web_search 기본이 켜짐이다 — 맥락에 없는 것을 물으면 모델이 웹에서 찾아
@@ -298,22 +298,28 @@ class RagController:
         history 는 같은 세션의 앞선 대화다. {user_query, ai_response} 목록이면
         되고(DB 의 세션 기록이 그 모양이다), '## 이전 대화' 절로 따로 내려간다.
         "그거", "방금 말한 거" 를 푸는 단서일 뿐 근거는 아니다.
+
+        summary 는 창 밖으로 밀려난 대화의 요약이다(summarize_session 이 만든다).
+        '## 이전 대화 요약' 절로 따로 내려간다.
         """
         return self._require_llm().answer(query, contexts, provider=provider,
                                           web_search=web_search, external=external,
-                                          history=history)
+                                          history=history, summary=summary)
 
     async def aanswer(self, query: str, contexts: list, provider: str | None = None,
                       web_search: bool = True, external: list | None = None,
-                      history: list | None = None) -> str:
+                      history: list | None = None,
+                      summary: str | None = None) -> str:
         """answer() 의 async 판. 이미 이벤트 루프 안이면 이쪽을 await 한다."""
         return await self._require_llm().aanswer(query, contexts, provider=provider,
                                                  web_search=web_search,
-                                                 external=external, history=history)
+                                                 external=external, history=history,
+                                                 summary=summary)
 
     def refine(self, query: str, contexts: list, draft: str,
                provider: str | None = None, web_search: bool = True,
-               external: list | None = None, history: list | None = None) -> str:
+               external: list | None = None, history: list | None = None,
+               summary: str | None = None) -> str:
         """다른 모델이 만든 답변 초안을 다듬는다. LLM 한 번.
 
         local_llm 이 초안을 만들고 사용자가 고른 모델이 다듬는 단계다. 고른 모델이
@@ -325,28 +331,31 @@ class RagController:
         web_search 기본이 켜짐이다. 초안을 만든 로컬 모델은 바깥을 못 보므로 여기서
         보완한다.
 
-        history 는 answer() 와 같다. 초안을 만들 때 준 것과 같은 대화를 줘야, 대명사를
-        초안이 제대로 짚었는지 다듬는 쪽이 판단할 수 있다.
+        history 와 summary 는 answer() 와 같다. 초안을 만들 때 준 것과 같은 대화를 줘야,
+        대명사와 생략된 대상을 초안이 제대로 짚었는지 다듬는 쪽이 판단할 수 있다.
         """
         return self._require_llm().refine(query, contexts, draft, provider=provider,
                                           web_search=web_search, external=external,
-                                          history=history)
+                                          history=history, summary=summary)
 
     async def arefine(self, query: str, contexts: list, draft: str,
                       provider: str | None = None, web_search: bool = True,
                       external: list | None = None,
-                      history: list | None = None) -> str:
+                      history: list | None = None,
+                      summary: str | None = None) -> str:
         """refine() 의 async 판."""
         return await self._require_llm().arefine(query, contexts, draft,
                                                  provider=provider,
                                                  web_search=web_search,
-                                                 external=external, history=history)
+                                                 external=external, history=history,
+                                                 summary=summary)
 
     def refine_all(self, query: str, contexts: list, draft: str,
                    providers: list[str], parallel: bool = True,
                    web_search: bool = True,
                    external: list | None = None,
-                   history: list | None = None) -> dict[str, str]:
+                   history: list | None = None,
+                   summary: str | None = None) -> dict[str, str]:
         """고른 모델들이 같은 초안을 각자 다듬는다. {provider: 다듬은 답변}.
 
         사용자가 한 질의에 모델을 여러 개 골랐을 때 쓰는 단계다. 목록 길이만큼
@@ -360,17 +369,18 @@ class RagController:
         """
         return self._require_llm().refine_all(query, contexts, draft, providers,
                                               parallel, web_search, external,
-                                              history)
+                                              history, summary)
 
     async def arefine_all(self, query: str, contexts: list, draft: str,
                           providers: list[str], parallel: bool = True,
                           web_search: bool = True,
                           external: list | None = None,
-                          history: list | None = None) -> dict[str, str]:
+                          history: list | None = None,
+                          summary: str | None = None) -> dict[str, str]:
         """refine_all() 의 async 판."""
         return await self._require_llm().arefine_all(query, contexts, draft,
                                                      providers, parallel, web_search,
-                                                     external, history)
+                                                     external, history, summary)
 
     def merge(self, question: str, answers: list[str],
               provider: str | None = None) -> str:
@@ -391,6 +401,33 @@ class RagController:
                      provider: str | None = None) -> str:
         """merge() 의 async 판."""
         return await self._require_llm().amerge(question, answers, provider=provider)
+
+    def summarize_session(self, previous_summary: str, dropped_turns: list[dict],
+                          provider: str | None = None) -> str:
+        """창 밖으로 밀려난 대화를 요약에 눌러 담는다. 갱신된 요약을 돌려준다.
+
+        answer() 에 넘기는 history 는 글자 상한이 있어 오래된 차례부터 버린다.
+        버려진 차례에만 있던 고유명사를 여기서 붙든다 — 1턴에 '2026년 우송대 취업률'
+        을 묻고 9턴에 '그럼 작년은?' 하면, 요약이 없으면 무엇의 작년인지 알 수 없다.
+
+        누적이다. 전체 대화가 아니라 '기존 요약 + 새로 밀려난 차례' 만 넣는다.
+        결과를 세션에 저장했다가 다음 질의의 summary 인자로 넘기면 된다.
+
+            summary = rag.summarize_session(summary, dropped)
+            rag.answer(query, contexts, history=recent, summary=summary)
+
+        dropped_turns 는 history 와 같은 모양이다({user_query, ai_response} 목록).
+        비어 있으면 LLM 을 부르지 않고 기존 요약을 그대로 돌려준다.
+        """
+        return self._require_llm().summarize_session(previous_summary, dropped_turns,
+                                                     provider=provider)
+
+    async def asummarize_session(self, previous_summary: str, dropped_turns: list[dict],
+                                 provider: str | None = None) -> str:
+        """summarize_session() 의 async 판."""
+        return await self._require_llm().asummarize_session(previous_summary,
+                                                            dropped_turns,
+                                                            provider=provider)
 
     #------------------------------------------------┌> 축약어 사전
 
