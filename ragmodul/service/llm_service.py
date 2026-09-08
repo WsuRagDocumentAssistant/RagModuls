@@ -42,7 +42,7 @@ from typing import Any
 
 from pydantic import BaseModel, ValidationError
 
-from ..models.image_model import ImageDescription
+from ..models.image_model import ImageDescription, ImageQuery
 from ..models.session_model import SessionSummary
 from ..models.vocab_model import QueryTerms, VocabPair, VocabPairs
 from ..prompt import get_prompt
@@ -207,7 +207,8 @@ class LlmService:
     async def aanswer(self, query: str, contexts: list, provider: str | None = None,
                       web_search: bool = True, external: list | None = None,
                       history: list | None = None,
-                      summary: str | None = None) -> str:
+                      summary: str | None = None,
+                      images: list[dict] | None = None) -> str:
         """검색된 맥락으로 질문에 답한다.
 
         contexts 는 rerank() 를 지난 RetrievedContext 목록이다. 출처(breadcrumb)를
@@ -231,6 +232,12 @@ class LlmService:
         summary 는 창 밖으로 밀려난 대화의 요약이다(asummarize_session 이 만든다).
         history 에 섞지 않고 별도 절로 내려보낸다 — 요약은 차례가 아니라서 섞으면
         모델이 대화 한 줄로 읽는다.
+
+        images 는 [{"mime_type", "data": base64}] 다. 검색으로 고른 문서 그림을 모델이
+        직접 보게 한다. 여기 넣은 그림이 곧 사용자 화면에 뜨는 그림이므로, 모델이
+        번호를 고르거나 경로를 쓸 일이 없다 — 지어낼 자리가 없다.
+        실측으로 웹서치와 함께 써도 문제없다(구조화 출력과 달리 버려지지 않는다).
+        지원 형식은 provider 마다 다르다 — adescribe_image 의 표를 본다.
         """
 
         logger.info(f"질의 외부 데이터 {external}")
@@ -240,7 +247,8 @@ class LlmService:
         system, user = get_prompt("answer", context=block, query=query,
                                   external=_format_external(external), history=hist,
                                   summary=_format_summary(summary))
-        text = await self.aask(user, provider, system=system, web_search=web_search)
+        text = await self.aask(user, provider, system=system, web_search=web_search,
+                               images=images)
         logger.info("[%s] 답변: 맥락 %d개(%d자) -> %d자",
                     provider or self.default, used, len(block), len(text))
         return text
@@ -508,6 +516,41 @@ class LlmService:
         logger.info("재검토: %d개 중 새로 %d개", len(result.pairs), len(fresh))
         return fresh
 
+    async def ais_image_query(self, query: str, provider: str | None = None) -> bool:
+        """그림을 함께 보여줄 질의인지 가른다. LLM 한 번(짧다).
+
+        어느 그림인지는 정하지 않는다 — 그건 검색이 한다. 여기서는 그림을 붙일지
+        말지만 본다.
+
+        검색과 따로 돌 수 있다. 질의만 보고 판단하므로 임베딩·검색 결과를 기다릴
+        필요가 없다. asyncio.gather 로 검색과 함께 던지면 지연이 사실상 0 이다 —
+        직렬로 끼우면 이 호출만큼 답변이 늦어진다.
+
+        '그림·사진·도표·그래프·차트·이미지·표 를 직접 찾는 말' 일 때만 True 다.
+        내용을 묻는 말은 그림이 도움이 될 것 같아도 False 다.
+
+        한때 느슨하게(애매하면 True) 잡아봤는데 판정이 사실상 다 True 가 됐다 —
+        인사 말고는 안 걸러서 이 단계가 하는 일이 없었다(실측 7/12). 좁히니 12/12 다.
+        경계를 넓히려면 그만큼 규칙을 적어야 한다. 기준 없이 "애매하면" 만 두면
+        모델이 전부 True 로 간다.
+
+        실패하면 False 다. 좁게 잡기로 한 판정이라, 판정을 못 한 것을 '찾는 말이었다'
+        로 볼 근거가 없다. 사용자가 정말 그림을 원했으면 "그림 보여줘" 라고 다시
+        물으면 되고, 그때는 걸린다.
+        """
+        if not query or not query.strip():
+            return False
+
+        system, user = get_prompt("image_query", query=query)
+        result = await self.asend(user, ImageQuery, provider, system=system)
+        if result is None:
+            logger.warning("이미지 질의 판정 실패. 그림 없이 간다: %s", query[:40])
+            return False
+
+        logger.info("[%s] 이미지 질의 판정: %s -> %s",
+                    provider or self.default, query[:30], result.wants_image)
+        return result.wants_image
+
     async def adescribe_image(self, image: bytes, mime_type: str,
                               provider: str | None = None) -> ImageDescription:
         """그림 한 장을 검색 가능한 텍스트로 옮긴다. 색인 때 장당 한 번.
@@ -708,9 +751,10 @@ class LlmService:
 
     def answer(self, query: str, contexts: list, provider: str | None = None,
                web_search: bool = True, external: list | None = None,
-               history: list | None = None, summary: str | None = None) -> str:
+               history: list | None = None, summary: str | None = None,
+               images: list[dict] | None = None) -> str:
         return _run(self.aanswer(query, contexts, provider, web_search, external,
-                                 history, summary))
+                                 history, summary, images))
 
     def refine(self, query: str, contexts: list, draft: str,
                provider: str | None = None, web_search: bool = True,
@@ -751,6 +795,9 @@ class LlmService:
     def extract_query_terms(self, query: str, provider: str | None = None) -> list[str]:
         return _run(self.aextract_query_terms(query, provider))
 
+    def is_image_query(self, query: str, provider: str | None = None) -> bool:
+        return _run(self.ais_image_query(query, provider))
+
     def describe_image(self, image: bytes, mime_type: str,
                        provider: str | None = None) -> ImageDescription:
         return _run(self.adescribe_image(image, mime_type, provider))
@@ -763,8 +810,9 @@ class LlmService:
 
     def ask(self, prompt: str, provider: str | None = None,
             system: str | None = None, response_format: dict | None = None,
-            web_search: bool = False) -> str:
-        return _run(self.aask(prompt, provider, system, response_format, web_search))
+            web_search: bool = False, images: list[dict] | None = None) -> str:
+        return _run(self.aask(prompt, provider, system, response_format, web_search,
+                              images))
 
     #------------------------------------------------┌> 관리
 

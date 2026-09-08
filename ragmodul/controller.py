@@ -286,7 +286,8 @@ class RagController:
 
     def answer(self, query: str, contexts: list, provider: str | None = None,
                web_search: bool = True, external: list | None = None,
-               history: list | None = None, summary: str | None = None) -> str:
+               history: list | None = None, summary: str | None = None,
+               images: list[dict] | None = None) -> str:
         """검색된 맥락으로 답변을 만든다. rerank() 다음 단계다.
 
         web_search 기본이 켜짐이다 — 맥락에 없는 것을 물으면 모델이 웹에서 찾아
@@ -305,17 +306,19 @@ class RagController:
         """
         return self._require_llm().answer(query, contexts, provider=provider,
                                           web_search=web_search, external=external,
-                                          history=history, summary=summary)
+                                          history=history, summary=summary,
+                                          images=images)
 
     async def aanswer(self, query: str, contexts: list, provider: str | None = None,
                       web_search: bool = True, external: list | None = None,
                       history: list | None = None,
-                      summary: str | None = None) -> str:
+                      summary: str | None = None,
+                      images: list[dict] | None = None) -> str:
         """answer() 의 async 판. 이미 이벤트 루프 안이면 이쪽을 await 한다."""
         return await self._require_llm().aanswer(query, contexts, provider=provider,
                                                  web_search=web_search,
                                                  external=external, history=history,
-                                                 summary=summary)
+                                                 summary=summary, images=images)
 
     def refine(self, query: str, contexts: list, draft: str,
                provider: str | None = None, web_search: bool = True,
@@ -436,6 +439,31 @@ class RagController:
                                                             provider=provider)
 
     #------------------------------------------------┌> 이미지 설명
+
+    def is_image_query(self, query: str, provider: str | None = None) -> bool:
+        """그림을 함께 보여줄 질의인지 가른다. LLM 한 번(짧다).
+
+        어느 그림인지는 정하지 않는다 — 그건 검색이 한다. 붙일지 말지만 본다.
+
+        질의만 보므로 검색과 따로 돌 수 있다. 검색 체인과 함께 던지면 지연이
+        사실상 0 이다. 직렬로 끼우면 이 호출만큼 답변이 늦어진다.
+
+            wants, (vector, weights) = await asyncio.gather(
+                rag.ais_image_query(query), ...)
+
+        '그림·사진·도표·그래프·차트·이미지·표 를 직접 찾는 말' 일 때만 True 다.
+        내용을 묻는 말은 그림이 도움이 될 것 같아도 False 다 — "중도탈락 예방 절차가
+        어떻게 돼?" 는 절차도가 있어도 False 다. 실패해도 False 다.
+
+        표를 넣은 이유: 표를 물으면 보통 텍스트 검색이 마크다운 표로 답하지만,
+        문서에는 표를 이미지로 붙여넣은 것들이 있다. 그건 본문에 글자가 없어서
+        이미지 검색이 유일한 경로다.
+        """
+        return self._require_llm().is_image_query(query, provider=provider)
+
+    async def ais_image_query(self, query: str, provider: str | None = None) -> bool:
+        """is_image_query() 의 async 판. 검색과 함께 gather 할 때 이쪽을 쓴다."""
+        return await self._require_llm().ais_image_query(query, provider=provider)
 
     def describe_image(self, image: bytes, mime_type: str,
                        provider: str | None = None) -> ImageDescription:

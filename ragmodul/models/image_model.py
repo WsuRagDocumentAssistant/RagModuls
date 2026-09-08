@@ -12,6 +12,13 @@
 from pydantic import BaseModel, Field
 
 
+class ImageQuery(BaseModel):
+    """is_image_query 의 출력. 사용자가 그림을 찾고 있는지."""
+    wants_image: bool = Field(
+        description="그림·사진·도표·그래프·차트·이미지·표 를 직접 찾는 말이면 true. "
+                    "내용을 묻는 말은 그림이 도움이 될 것 같아도 false")
+
+
 class ImageDescription(BaseModel):
     """describe_image 의 출력. 설명할 것이 없는 그림이면 세 값이 다 비어도 된다."""
     ai_summary: str = Field(

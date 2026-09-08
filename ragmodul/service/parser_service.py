@@ -47,6 +47,9 @@ def _save_images(model, out_dir: str, unpack_dir: str) -> dict[str, str]:
 
     문서마다 하위 폴더를 만든다. 이미지 ref가 문서 안에서만 유일해서(image1, image2...)
     문서 두 개를 처리하면 image1.jpg가 서로 덮어쓴다.
+
+    BMP는 PNG로 바꿔 저장한다(_to_png). 여기서 한 번 바꾸면 그 뒤로는 아무도 BMP를
+    보지 않는다 - DB에 적히는 경로도, 클라이언트가 받는 파일도 PNG다.
     """
     if not model.images:
         return {}
@@ -56,19 +59,74 @@ def _save_images(model, out_dir: str, unpack_dir: str) -> dict[str, str]:
     target.mkdir(parents=True, exist_ok=True)
 
     source_root = _unpacked_root(unpack_dir, stem)
-    saved, missing = {}, []
+    saved, missing, converted = {}, [], 0
     for ref, image in model.images.items():
         src = source_root / image.path if source_root else None
         if src is None or not src.is_file():
             missing.append(ref)
             continue
-        shutil.copy2(src, target / Path(image.path).name)   # 수정시각까지 보존
-        saved[ref] = str(target / Path(image.path).name)
 
-    logger.info("이미지 저장: %d개 -> %s", len(saved), target)
+        dst = target / Path(image.path).name
+        png = _to_png(src, dst)
+        if png is not None:
+            dst = png                   # 확장자가 .png 로 바뀌었다
+            converted += 1
+        else:
+            shutil.copy2(src, dst)      # 수정시각까지 보존
+        saved[ref] = str(dst)
+
+    logger.info("이미지 저장: %d개 -> %s (PNG 변환 %d개)", len(saved), target, converted)
     if missing:
         logger.warning("원본을 못 찾은 이미지 %d개: %s", len(missing), missing[:5])
     return saved
+
+
+# BMP만 바꾼다. jpg는 이미 압축돼 있어 PNG로 바꾸면 오히려 커지고, PNG는 바꿀 게 없다.
+_CONVERT_TO_PNG = {".bmp", ".dib"}
+
+
+def _to_png(src: Path, dst: Path) -> Path | None:
+    """BMP면 PNG로 저장하고 그 경로를 준다. 아니면 아무것도 안 하고 None.
+
+    왜 바꾸나(실측, 문서 하나 243장 기준) -
+      BMP   39개  합계 106.6MB  최대 15.8MB  평균 2,799KB
+      그 외 42개  합계   7.5MB  최대  1.1MB  평균   182KB
+    BMP는 무압축이라 장수는 비슷한데 용량이 14배다. LLM에 보낼 때 base64로 33%가 더
+    붙어서, 15.8MB짜리는 21MB가 되어 Gemini 인라인 한도(약 20MB)를 넘긴다.
+
+    PNG는 무손실이라 화질이 그대로다. 도표의 가는 선과 작은 글자가 안 뭉개진다 -
+    JPEG로 바꿨다면 그게 망가져서 그림 속 글자를 읽는 작업에 나빴을 것이다.
+
+    형식 제약도 같이 풀린다(실측):
+      gpt / claude   BMP를 400으로 거부
+      gemini / local BMP를 읽음
+    바꿔두면 provider를 자유롭게 고를 수 있다.
+
+    돌려주는 경로는 확장자가 .png다. 부르는 쪽이 그걸 그대로 기록하므로 DB의
+    image_path도 .png가 되고, 클라이언트가 그 경로로 파일을 찾는다.
+
+    Pillow가 없거나 읽지 못하는 파일이면 None을 주고 부르는 쪽이 그냥 복사한다 -
+    변환은 최적화지 필수가 아니다. 그림을 잃는 것보다 큰 채로 두는 편이 낫다.
+    """
+    if src.suffix.lower() not in _CONVERT_TO_PNG:
+        return None
+    try:
+        from PIL import Image
+    except ImportError:
+        logger.warning("Pillow가 없어 BMP를 그대로 둔다: %s", src.name)
+        return None
+
+    dst_png = dst.with_suffix(".png")
+    try:
+        with Image.open(src) as img:
+            img.save(dst_png, format="PNG", optimize=True)
+    except Exception as e:                          # noqa: BLE001
+        logger.warning("PNG 변환 실패, 원본을 쓴다: %s (%s)", src.name, e)
+        return None
+
+    logger.debug("PNG 변환: %s %.1fMB -> %.1fMB", src.name,
+                 src.stat().st_size / 1048576, dst_png.stat().st_size / 1048576)
+    return dst_png
 
 
 def _unpacked_root(unpack_dir: str, stem: str) -> Path | None:
