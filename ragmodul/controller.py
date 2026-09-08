@@ -403,27 +403,32 @@ class RagController:
         return await self._require_llm().amerge(question, answers, provider=provider)
 
     def summarize_session(self, previous_summary: str, dropped_turns: list[dict],
-                          provider: str | None = None) -> str:
-        """창 밖으로 밀려난 대화를 요약에 눌러 담는다. 갱신된 요약을 돌려준다.
+                          provider: str | None = None) -> tuple[str, str]:
+        """창 밖으로 밀려난 대화를 요약에 눌러 담는다. (갱신된 요약, 주제).
 
         answer() 에 넘기는 history 는 글자 상한이 있어 오래된 차례부터 버린다.
         버려진 차례에만 있던 고유명사를 여기서 붙든다 — 1턴에 '2026년 우송대 취업률'
         을 묻고 9턴에 '그럼 작년은?' 하면, 요약이 없으면 무엇의 작년인지 알 수 없다.
 
         누적이다. 전체 대화가 아니라 '기존 요약 + 새로 밀려난 차례' 만 넣는다.
-        결과를 세션에 저장했다가 다음 질의의 summary 인자로 넘기면 된다.
+        요약을 세션에 저장했다가 다음 질의의 summary 인자로 넘기면 된다.
 
-            summary = rag.summarize_session(summary, dropped)
+            summary, topic = rag.summarize_session(summary, dropped)
             rag.answer(query, contexts, history=recent, summary=summary)
 
+        주제는 한 줄이고 같은 호출에서 나오므로 비용이 더 들지 않는다. 다만 이 메서드가
+        보는 건 밀려난 차례들뿐이라 '압축한 구간의 주제' 다 — 화제가 막 바뀐 직후에는
+        이전 주제가 남는다.
+
         dropped_turns 는 history 와 같은 모양이다({user_query, ai_response} 목록).
-        비어 있으면 LLM 을 부르지 않고 기존 요약을 그대로 돌려준다.
+        비어 있으면 LLM 을 부르지 않고 (기존 요약, "") 를 돌려준다. 주제가 빈 문자열일
+        때는 갱신하지 말고 쓰던 주제를 두면 된다.
         """
         return self._require_llm().summarize_session(previous_summary, dropped_turns,
                                                      provider=provider)
 
     async def asummarize_session(self, previous_summary: str, dropped_turns: list[dict],
-                                 provider: str | None = None) -> str:
+                                 provider: str | None = None) -> tuple[str, str]:
         """summarize_session() 의 async 판."""
         return await self._require_llm().asummarize_session(previous_summary,
                                                             dropped_turns,
@@ -438,7 +443,8 @@ class RagController:
         통째로 한 번(12 개) 뒤에 recheck_vocab 을 한 번 더 돌리면 18 개다 — 호출 2 번이
         더 많이 찾는다. 쪼개면 문서 앞뒤에 흩어진 '축약어 ... 풀어쓴 말' 을 못 잇는다.
 
-        로컬 모델은 컨텍스트가 8192 토큰이라 문서 전체가 안 들어간다. 클라우드
+        예전에는 로컬이 컨텍스트 8192 토큰이라 문서 전체가 안 들어갔다. 100k 로 늘어서
+        이제 들어간다 — 품질이 클라우드에 견주는지는 재보지 않았다. 지금은 클라우드
         provider 를 쓰거나, 로컬로 하려면 글을 잘라서 여러 번 불러야 한다.
         """
         return self._require_llm().extract_vocab(text, provider=provider)

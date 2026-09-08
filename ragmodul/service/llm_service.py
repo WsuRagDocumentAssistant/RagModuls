@@ -41,6 +41,7 @@ from typing import Any
 
 from pydantic import BaseModel, ValidationError
 
+from ..models.session_model import SessionSummary
 from ..models.vocab_model import QueryTerms, VocabPair, VocabPairs
 from ..prompt import get_prompt
 
@@ -54,24 +55,55 @@ LOCAL_PROVIDER = "local_llm"
 # (실측: max_tokens=16 에 응답이 None).
 CLOUD_MAX_TOKENS = 8192
 
-# 로컬 모델은 입력+출력 합쳐 8192 토큰이 상한이다. 출력에 다 주면 입력 자리가 0 이 되어
-# 400 이 난다("you requested 8192 output tokens ... upper bound for 0 input tokens").
-LOCAL_MAX_TOKENS = 2048
-
-# 로컬에 실을 맥락 상한(글자). 실측으로 계산했다 —
-#   컨텍스트 8192 토큰, 한국어 글자당 0.68 토큰(12,000자 = 8,185 토큰)
-#   8192 - 2048(출력) - 1,400(답변 시스템 프롬프트) ≈ 4,700 토큰 ≈ 6,900자
-# 여유를 두고 6,500 으로 잡는다.
+# 로컬 모델의 출력 상한(≈ 한국어 12,000자). 넘으면 에러가 아니라 문장이 잘린다.
 #
-# 없으면 실제로 터진다: 문서와 무관한 질의가 오면 조각이 여러 부모에 흩어지고 섹션이
-# 전부 승격돼(child 하나뿐인 부모는 hit 1개로 비율 1.0) 맥락이 17,286자가 됐다.
-# 게이트웨이가 413 Payload Too Large 로 잘랐다.
-LOCAL_CONTEXT_CHARS = 6500
+# 예전에는 2,048 이었다. 입력과 출력이 8192 를 나눠 쓰던 시절이라 출력을 묶어야 했다
+# (출력에 다 주면 입력 자리가 0 이 되어 400 이 났다). 컨텍스트가 100k 로 늘어서 그
+# 제약이 사라졌으므로 클라우드와 같은 값으로 맞춘다.
+#
+# 상한이지 목표가 아니다. 실측 초안이 205~609자라 평소에는 근처도 안 간다 — 표가
+# 여럿 붙은 긴 답변에서 잘리지 않게 두는 것이다.
+LOCAL_MAX_TOKENS = CLOUD_MAX_TOKENS
+
+# 로컬에 실을 맥락 상한(글자).
+#
+# 값의 근거는 '리랭커가 고른 top_k 가 어떤 조합이어도 안 잘린다' 다. 부모 크기 편차가
+# 커서 개수로는 못 잡는다 — 실측(부모 32개): 최대 5,987자, 중앙값 2,466자,
+# 상위 5개 합 27,296자. 승격된 부모 5개가 걸리면 그만큼 나간다.
+# 27,296 을 덮고, 문서가 늘거나 top_k 를 키울 때를 위해 여유를 더 둬서 45,000 으로
+# 잡는다. 지금 데이터로는 못 채우는 값이다 — 채우려고 둔 게 아니라 잘리지 않게 둔 것이다.
+#
+# 평소에는 안 닿는다. 실측한 정상 질의의 맥락은 1,944~2,602자였다. 상한은 최악의
+# 조합에서 조용히 잘리는 걸 막으려는 것이고, 매번 30,000자를 보내는 게 아니다.
+#
+# 예전 값 6,500 은 컨텍스트가 8192 토큰일 때 '8192 - 2048(출력) - 1,400(시스템
+# 프롬프트) ≈ 4,700 토큰' 으로 계산한 것이다. 두 한도가 다 풀려서 근거가 사라졌다 —
+#   모델 컨텍스트  8192 -> 100k 토큰 (한국어 14만 자쯤)
+#   게이트웨이     32,768바이트(12,800자에서 413) -> 실측 80,000자 통과
+# 30,000자는 약 20,400 토큰으로 100k 의 20% 다.
+#
+# 더 올리지 않는 이유는 프리필 시간이다. 실측으로 글자당 약 0.1ms 선형이다
+# (20,000자 1.5초 / 40,000자 3.1초 / 80,000자 7.9초). 로컬은 초안 단계라 이 시간이
+# 사용자 대기에 그대로 더해진다.
+LOCAL_CONTEXT_CHARS = 45000
 
 # 이전 대화에 쓸 글자 상한. 넘치면 오래된 차례를 버린다.
-# 1,500자면 두세 차례가 들어간다. 대명사("그거", "방금 말한 거")가 가리키는 건
-# 거의 직전 차례라 그 정도로 충분하다.
-HISTORY_CHARS = 1500
+#
+# 차례 수로는 못 잡는다. 답변 길이가 실측 430~931자라 표가 붙으면 한 차례가 1,500자를
+# 넘고, 짧은 문답이면 100자도 안 된다. 30,000자는 긴 차례로 20번쯤이다.
+#
+# 예전 값 1,500 은 답변 두 차례밖에 안 들어갔다. "아까 물어본 것 중에 두 번째" 처럼
+# 몇 차례 앞을 가리키는 질문이 그걸로는 안 풀린다.
+#
+# 이 값만 올려도 소용없다. 클라이언트가 먼저 압축해서 밀어내므로, 그쪽 기준이 실제로
+# 묶는 값이다. 여기를 조금 크게 두는 건 클라이언트가 압축하기 전에 모듈이 먼저 자르지
+# 않게 하려는 것이다 — 모듈이 자르면 그 차례는 요약도 안 된 채 사라진다.
+# 클라이언트 기준은 이 값보다 낮게 잡는다.
+#
+# 맨 앞(가장 최근) 한 차례는 이 상한을 넘겨도 담는다. 대명사가 가리키는 게 거의
+# 직전 차례라, 그게 길다는 이유로 버리면 절이 있으나 마나다. 그래서 이 값은 보장이
+# 아니라 목표치다 — 반환값이 이보다 길 수 있다.
+HISTORY_CHARS = 30000
 
 # temperature 를 보내면 400 이 나는 provider. claude 는 ai-rag-comm 이 경고 후 무시하고,
 # gemini/local 은 정상으로 받는다. gpt 만 모델이 거부한다 —
@@ -333,8 +365,8 @@ class LlmService:
         return text
 
     async def asummarize_session(self, previous_summary: str, dropped_turns: list[dict],
-                                 provider: str | None = None) -> str:
-        """창 밖으로 밀려난 대화를 요약에 눌러 담는다. 갱신된 요약을 돌려준다.
+                                 provider: str | None = None) -> tuple[str, str]:
+        """창 밖으로 밀려난 대화를 요약에 눌러 담는다. (갱신된 요약, 주제).
 
         _format_history 가 HISTORY_CHARS 를 넘으면 오래된 차례부터 버린다. 버려진
         차례에만 있던 고유명사를 여기서 붙든다 — '2026년 우송대 취업률' 을 1턴에
@@ -348,30 +380,38 @@ class LlmService:
         문서에서 다시 가져온다. 요약이 지켜야 하는 건 '무엇에 대해 이야기하던 중인가'
         뿐이다.
 
-        구조화 출력을 쓰지 않는다. 세 문장짜리 평문 한 덩이라 스키마로 감쌀 이득이
-        없다. 웹서치도 안 쓴다 — 있던 대화를 줄이는 일이라 바깥을 볼 이유가 없고,
-        켜면 없던 내용이 섞여 들어온다.
+        주제는 같은 호출에서 함께 받는다. 값이 둘이라 구조화 출력을 쓴다 — 평문으로
+        받아 "요약:" / "주제:" 를 잘라 쓰면 모델이 형식을 흘릴 때마다 깨진다.
+        웹서치는 asend 가 절대 켜지 않는다(구조화 출력과 함께 못 간다). 있던 대화를
+        줄이는 일이라 어차피 바깥을 볼 이유가 없다.
+
+        주제는 '압축한 구간의 주제' 다. 이 메서드가 보는 건 밀려난 차례들뿐이라,
+        화제가 막 바뀐 직후에는 이전 주제가 남는다. 부르는 쪽이 알고 쓴다.
         """
         turns = _turn_blocks(dropped_turns)
         if not turns:
             logger.info("밀려난 차례가 없다. 기존 요약을 그대로 둔다.")
-            return previous_summary or ""
+            return previous_summary or "", ""
 
         blocks = "\n\n".join(f"<차례{i}>\n{t}\n</차례{i}>"
                              for i, t in enumerate(turns, 1))
         system, user = get_prompt("session_summary",
                                   summary=(previous_summary or "").strip() or "(없음)",
                                   conversations=blocks)
-        text = await self.aask(user, provider, system=system)
-        text = text.strip()
+        result = await self.asend(user, SessionSummary, provider, system=system)
+
+        text = (result.summary if result else "").strip()
         if not text:
             # 요약을 못 만들었다고 기존 것을 버리면 오래된 고유명사가 통째로 사라진다.
+            # 주제만 빈 문자열로 돌려주고, 부르는 쪽이 기존 주제를 유지하게 둔다.
             logger.warning("세션 요약이 비어 있다. 기존 요약을 유지한다.")
-            return previous_summary or ""
-        logger.info("[%s] 세션 요약: %d차례 + 기존 %d자 -> %d자",
+            return previous_summary or "", ""
+
+        topic = (result.topic or "").strip()
+        logger.info("[%s] 세션 요약: %d차례 + 기존 %d자 -> %d자 / 주제 %r",
                     provider or self.default, len(turns),
-                    len(previous_summary or ""), len(text))
-        return text
+                    len(previous_summary or ""), len(text), topic)
+        return text, topic
 
     #------------------------------------------------┌> 축약어 사전 (async 본체)
 
@@ -382,7 +422,8 @@ class LlmService:
         (7-Core / 7-CORE)을 모델이 정리하지 못한다 — 각 호출이 자기 텍스트만 보기
         때문이다. 놓치는 건 recheck_vocab 으로 메운다.
 
-        로컬 모델은 컨텍스트가 8192 토큰이라 문서 전체(약 45k)를 못 받는다. 클라우드로.
+        예전에는 로컬이 컨텍스트 8192 토큰이라 문서 전체(약 45k)를 못 받았다. 100k 로
+        늘어서 이제 들어간다 — 로컬로 돌릴 수 있는지는 다시 재봐야 한다.
 
         웹서치는 쓰지 않는다. 문서에서 뽑는 작업이라 바깥을 볼 이유가 없고, 웹서치를
         켜면 ai-rag-comm 이 response_format 을 경고만 남기고 버려서 구조화 출력이
@@ -565,7 +606,7 @@ class LlmService:
                                      web_search, external, history, summary))
 
     def summarize_session(self, previous_summary: str, dropped_turns: list[dict],
-                          provider: str | None = None) -> str:
+                          provider: str | None = None) -> tuple[str, str]:
         return _run(self.asummarize_session(previous_summary, dropped_turns, provider))
 
     def merge(self, question: str, answers: list[str],
@@ -862,6 +903,7 @@ def _format_history(history: list | None, max_chars: int = HISTORY_CHARS) -> str
         if turns and total + len(block) > max_chars:
             logger.info("이전 대화 자름: %d차례 중 %d차례만 (%d자)",
                         len(history), len(turns), total)
+            logger.debug("자른 차례: %s", block)
             break
         turns.append(block)
         total += len(block)

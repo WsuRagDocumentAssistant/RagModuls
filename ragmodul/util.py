@@ -175,13 +175,17 @@ def to_plain_sparse(weights: dict) -> dict:
 
 #------------------------------------------------┌> 글 묶기
 
-# 로컬 모델(gemma-4-12B-it) 한 요청에 들어가는 본문 크기. 실측으로 계산했다 —
-#   컨텍스트 8192 토큰(입력+출력). 엔드포인트가 그대로 알려준다:
-#     "This model's maximum context length is 8192 tokens. However, you requested
-#      8 output tokens and your prompt contains at least 8185 input tokens"
-#   한국어 12,000자 = 8,185 토큰 -> 글자당 0.68 토큰
-#   8192 - 2048(출력 자리) - 950(vocab 시스템 프롬프트 1,395자) = 5,194 토큰 ≈ 7,600자
-# 7,600 을 그대로 쓰면 프롬프트를 조금 손볼 때마다 넘치므로 여유를 둔다.
+# 한 요청에 들어가는 본문 크기의 기본값.
+#
+# 6,500 은 로컬 컨텍스트가 8192 토큰이던 때 계산한 값이다. 엔드포인트가 한도를 그대로
+# 알려줬다: "This model's maximum context length is 8192 tokens. However, you
+# requested 8 output tokens and your prompt contains at least 8185 input tokens".
+# 거기서 한국어 12,000자 = 8,185 토큰(글자당 0.68 토큰)을 얻었고,
+# 8192 - 2048(출력) - 950(vocab 시스템 프롬프트) = 5,194 토큰 ≈ 7,600자 에 여유를 뒀다.
+#
+# 로컬 컨텍스트는 100k 로 늘었지만 이 기본값은 그대로 둔다. 부르는 쪽이 max_chars 로
+# 덮어쓰는 값이고(RagSystem 은 30,000 을 쓴다), 크게 잡으면 한 요청이 길어져 타임아웃과
+# 재시도 비용이 커진다 — 조각을 나누는 이유가 컨텍스트만은 아니다.
 DEFAULT_PACK_CHARS = 6500
 
 
