@@ -257,7 +257,8 @@ class LlmService:
                       provider: str | None = None, web_search: bool = True,
                       external: list | None = None,
                       history: list | None = None,
-                      summary: str | None = None) -> str:
+                      summary: str | None = None,
+                      images: list[dict] | None = None) -> str:
         """다른 모델이 만든 답변 초안을 Context 와 견주어 고친다.
 
         local_llm 이 초안을 만들고 사용자가 고른 모델이 다듬는 흐름에 쓴다.
@@ -285,7 +286,8 @@ class LlmService:
         system, user = get_prompt("refine", context=block, query=query, draft=draft,
                                   external=_format_external(external), history=hist,
                                   summary=_format_summary(summary))
-        text = await self.aask(user, provider, system=system, web_search=web_search)
+        text = await self.aask(user, provider, system=system, web_search=web_search,
+                               images=images)
         logger.info("[%s] 다듬기: 초안 %d자 + 맥락 %d개(%d자) -> %d자",
                     provider or self.default, len(draft), used, len(block), len(text))
         return text
@@ -295,7 +297,8 @@ class LlmService:
                           web_search: bool = True,
                           external: list | None = None,
                           history: list | None = None,
-                          summary: str | None = None) -> dict[str, str]:
+                          summary: str | None = None,
+                          images: list[dict] | None = None) -> dict[str, str]:
         """고른 모델들이 같은 초안을 각자 다듬는다. {provider: 다듬은 답변}.
 
         하나가 죽어도 나머지는 돌려준다 — 한도(429)나 키 없음으로 한쪽만 실패하는 게
@@ -324,7 +327,7 @@ class LlmService:
             # return_exceptions 를 안 켜면 하나가 터질 때 나머지가 취소되고 예외만 올라온다
             results = await asyncio.gather(
                 *(self.arefine(query, contexts, draft, name, web_search, external,
-                               history, summary)
+                               history, summary, images)
                   for name in targets),
                 return_exceptions=True,
             )
@@ -334,7 +337,7 @@ class LlmService:
                 try:
                     results.append(
                         await self.arefine(query, contexts, draft, name, web_search,
-                                           external, history, summary))
+                                           external, history, summary, images))
                 except Exception as e:
                     results.append(e)
 
@@ -759,18 +762,19 @@ class LlmService:
     def refine(self, query: str, contexts: list, draft: str,
                provider: str | None = None, web_search: bool = True,
                external: list | None = None, history: list | None = None,
-               summary: str | None = None) -> str:
+               summary: str | None = None, images: list[dict] | None = None) -> str:
         return _run(self.arefine(query, contexts, draft, provider, web_search,
-                                 external, history, summary))
+                                 external, history, summary, images))
 
     def refine_all(self, query: str, contexts: list, draft: str,
                    providers: list[str], parallel: bool = True,
                    web_search: bool = True,
                    external: list | None = None,
                    history: list | None = None,
-                   summary: str | None = None) -> dict[str, str]:
+                   summary: str | None = None,
+                   images: list[dict] | None = None) -> dict[str, str]:
         return _run(self.arefine_all(query, contexts, draft, providers, parallel,
-                                     web_search, external, history, summary))
+                                     web_search, external, history, summary, images))
 
     def summarize_session(self, previous_summary: str, dropped_turns: list[dict],
                           provider: str | None = None) -> tuple[str, str]:

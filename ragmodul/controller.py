@@ -323,7 +323,8 @@ class RagController:
     def refine(self, query: str, contexts: list, draft: str,
                provider: str | None = None, web_search: bool = True,
                external: list | None = None, history: list | None = None,
-               summary: str | None = None) -> str:
+               summary: str | None = None,
+               images: list[dict] | None = None) -> str:
         """다른 모델이 만든 답변 초안을 다듬는다. LLM 한 번.
 
         local_llm 이 초안을 만들고 사용자가 고른 모델이 다듬는 단계다. 고른 모델이
@@ -340,26 +341,29 @@ class RagController:
         """
         return self._require_llm().refine(query, contexts, draft, provider=provider,
                                           web_search=web_search, external=external,
-                                          history=history, summary=summary)
+                                          history=history, summary=summary,
+                                          images=images)
 
     async def arefine(self, query: str, contexts: list, draft: str,
                       provider: str | None = None, web_search: bool = True,
                       external: list | None = None,
                       history: list | None = None,
-                      summary: str | None = None) -> str:
+                      summary: str | None = None,
+                      images: list[dict] | None = None) -> str:
         """refine() 의 async 판."""
         return await self._require_llm().arefine(query, contexts, draft,
                                                  provider=provider,
                                                  web_search=web_search,
                                                  external=external, history=history,
-                                                 summary=summary)
+                                                 summary=summary, images=images)
 
     def refine_all(self, query: str, contexts: list, draft: str,
                    providers: list[str], parallel: bool = True,
                    web_search: bool = True,
                    external: list | None = None,
                    history: list | None = None,
-                   summary: str | None = None) -> dict[str, str]:
+                   summary: str | None = None,
+                   images: list[dict] | None = None) -> dict[str, str]:
         """고른 모델들이 같은 초안을 각자 다듬는다. {provider: 다듬은 답변}.
 
         사용자가 한 질의에 모델을 여러 개 골랐을 때 쓰는 단계다. 목록 길이만큼
@@ -373,18 +377,20 @@ class RagController:
         """
         return self._require_llm().refine_all(query, contexts, draft, providers,
                                               parallel, web_search, external,
-                                              history, summary)
+                                              history, summary, images)
 
     async def arefine_all(self, query: str, contexts: list, draft: str,
                           providers: list[str], parallel: bool = True,
                           web_search: bool = True,
                           external: list | None = None,
                           history: list | None = None,
-                          summary: str | None = None) -> dict[str, str]:
+                          summary: str | None = None,
+                          images: list[dict] | None = None) -> dict[str, str]:
         """refine_all() 의 async 판."""
         return await self._require_llm().arefine_all(query, contexts, draft,
                                                      providers, parallel, web_search,
-                                                     external, history, summary)
+                                                     external, history, summary,
+                                                     images)
 
     def merge(self, question: str, answers: list[str],
               provider: str | None = None) -> str:
