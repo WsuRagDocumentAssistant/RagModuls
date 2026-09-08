@@ -562,6 +562,63 @@ class LlmService:
                     len(result.key_phrases))
         return result
 
+    async def adescribe_images_all(self, images: list[tuple[bytes, str]],
+                                   provider: str | None = None,
+                                   parallel: bool = True, max_concurrent: int = 4,
+                                   ) -> list[ImageDescription]:
+        """그림 여러 장을 동시에 설명한다. 입력과 같은 길이·같은 순서로 돌려준다.
+
+        images 는 (바이트, mime_type) 짝의 목록이다.
+
+        합치지 않는 이유: 사전 추출은 짝을 한 덩이로 모으면 되지만, 여기는 설명마다
+        어느 그림 것인지가 중요하다. 그래서 순서를 그대로 유지한다 — 부르는 쪽이
+        image_id 목록과 zip 하면 짝이 맞는다.
+
+        한 장이 실패해도 나머지는 살린다. 실패한 자리에는 빈 ImageDescription 이
+        들어간다 — None 을 넣으면 부르는 쪽이 매번 검사해야 하고, 빈 설명은 어차피
+        '임베딩 건너뜀' 으로 같게 처리되기 때문이다.
+        [주의] 그래서 반환값만 봐서는 실패와 '설명할 것 없는 로고' 가 구분되지 않는다.
+        구분이 필요하면 로그를 보거나 adescribe_image 를 직접 부른다.
+
+        max_concurrent 는 동시에 나가는 요청 수다. 사전 추출과 같은 이유로 상한을
+        둔다. 여기는 이미지라 요청 하나가 훨씬 무겁다 — 문서 그림이 1MB 를 넘는 게
+        흔하고 base64 로 33% 더 커진다. 한꺼번에 던지면 업로드 대역이 먼저 막힌다.
+        """
+        if not images:
+            return []
+
+        semaphore = asyncio.Semaphore(max_concurrent if parallel else 1)
+
+        async def one(index: int, data: bytes, mime: str) -> ImageDescription:
+            async with semaphore:
+                desc = await self.adescribe_image(data, mime, provider)
+                logger.info("이미지 설명 %d/%d: %s %d바이트 -> %s",
+                            index, len(images), mime, len(data),
+                            "빈 설명" if not (desc.ai_summary or desc.key_facts
+                                            or desc.key_phrases) else "설명 있음")
+                return desc
+
+        results = await asyncio.gather(
+            *(one(i, data, mime) for i, (data, mime) in enumerate(images, 1)),
+            return_exceptions=True)
+
+        described: list[ImageDescription] = []
+        failed = 0
+        for index, result in enumerate(results, 1):
+            if isinstance(result, BaseException):
+                failed += 1
+                logger.warning("이미지 설명 %d/%d 실패: %s - %s",
+                               index, len(images), type(result).__name__, result)
+                described.append(ImageDescription())
+            else:
+                described.append(result)
+
+        filled = sum(1 for d in described
+                     if d.ai_summary or d.key_facts or d.key_phrases)
+        logger.info("이미지 설명 합계: %d장 -> 설명 %d장 / 빈 것 %d장 / 실패 %d장",
+                    len(images), filled, len(images) - filled - failed, failed)
+        return described
+
     async def aextract_query_terms(self, query: str, provider: str | None = None) -> list[str]:
         """사용자 질의에 나온 축약어를 뽑는다. 이걸 vocab_short 에서 찾아 확장어를 붙인다."""
         system, user = get_prompt("query_terms", query=query)
@@ -697,6 +754,12 @@ class LlmService:
     def describe_image(self, image: bytes, mime_type: str,
                        provider: str | None = None) -> ImageDescription:
         return _run(self.adescribe_image(image, mime_type, provider))
+
+    def describe_images_all(self, images: list[tuple[bytes, str]],
+                            provider: str | None = None, parallel: bool = True,
+                            max_concurrent: int = 4) -> list[ImageDescription]:
+        return _run(self.adescribe_images_all(images, provider, parallel,
+                                              max_concurrent))
 
     def ask(self, prompt: str, provider: str | None = None,
             system: str | None = None, response_format: dict | None = None,

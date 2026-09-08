@@ -472,6 +472,41 @@ class RagController:
         return await self._require_llm().adescribe_image(image, mime_type,
                                                          provider=provider)
 
+    def describe_images_all(self, images: list[tuple[bytes, str]],
+                            provider: str | None = None, parallel: bool = True,
+                            max_concurrent: int = 4) -> list[ImageDescription]:
+        """그림 여러 장을 동시에 설명한다. 입력과 같은 길이·같은 순서.
+
+        문서 하나에 그림이 수백 장이라 순차로 돌리면 오래 걸린다 — 실측 그림 243장에
+        장당 3~4초면 15분이다. 동시에 넷이면 4분쯤이 된다.
+
+            pairs = [(data, mime) for data, mime in 그림들]
+            descs = rag.describe_images_all(pairs, provider="gemini")
+            for image_id, desc in zip(image_ids, descs):
+                if not (desc.ai_summary or desc.key_facts or desc.key_phrases):
+                    continue                      # 로고·장식은 건너뛴다
+                text = " ".join([desc.ai_summary, *desc.key_facts, *desc.key_phrases])
+                ...
+
+        순서가 유지되므로 image_id 목록과 zip 하면 짝이 맞는다. 실패한 자리에는 빈
+        설명이 들어가서, 실패와 '설명할 것 없는 그림' 이 반환값으로는 구분되지 않는다
+        — 둘 다 임베딩을 건너뛰면 되는 경우라 같게 뒀다. 구분이 필요하면 로그를 본다.
+
+        max_concurrent 는 동시 요청 수다. 이미지는 요청 하나가 무겁다(문서 그림이
+        1MB 를 넘는 게 흔하고 base64 로 33% 커진다). 늘리기 전에 업로드 대역을 본다.
+        """
+        return self._require_llm().describe_images_all(images, provider=provider,
+                                                       parallel=parallel,
+                                                       max_concurrent=max_concurrent)
+
+    async def adescribe_images_all(self, images: list[tuple[bytes, str]],
+                                   provider: str | None = None, parallel: bool = True,
+                                   max_concurrent: int = 4) -> list[ImageDescription]:
+        """describe_images_all() 의 async 판."""
+        return await self._require_llm().adescribe_images_all(
+            images, provider=provider, parallel=parallel,
+            max_concurrent=max_concurrent)
+
     #------------------------------------------------┌> 축약어 사전
 
     def extract_vocab(self, text: str, provider: str | None = None) -> list[VocabPair]:
