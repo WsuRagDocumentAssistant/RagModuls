@@ -14,6 +14,7 @@ RAG 처리 단계를 메서드로 제공한다.
 import logging
 
 from .models.chunk_model import ChunkedDocument
+from .models.image_model import ImageDescription
 from .models.search_model import DEFAULT_MERGE_RATIO, RetrievedContext
 from .models.vocab_model import VocabPair
 from .service.chunker_service import chunk
@@ -433,6 +434,43 @@ class RagController:
         return await self._require_llm().asummarize_session(previous_summary,
                                                             dropped_turns,
                                                             provider=provider)
+
+    #------------------------------------------------┌> 이미지 설명
+
+    def describe_image(self, image: bytes, mime_type: str,
+                       provider: str | None = None) -> ImageDescription:
+        """문서에서 뽑은 그림을 검색 가능한 텍스트로 옮긴다. 색인 때 장당 한 번.
+
+            desc = rag.describe_image(data, "image/png", provider="gpt")
+            text = " ".join([desc.ai_summary, *desc.key_facts, *desc.key_phrases])
+            vector = rag.embed_texts([text])[0]
+
+        세 값을 이어붙여 임베딩하는 걸 전제로 프롬프트를 짰다 — 사람이 읽을 글이
+        아니라 질의와 겹치는 말을 뽑는다. "취업률이 상승세" 처럼 요약하면 "2026년
+        취업률 그래프" 로 묻는 질문에 안 걸린다.
+
+        질의 때는 부르지 않는다. 설명이 이미 텍스트로 저장돼 있고, 초안을 만드는
+        로컬 모델은 이미지를 못 받는다.
+
+        로고·장식처럼 설명할 것이 없는 그림은 세 값이 빈 채로 온다. 그때는 임베딩을
+        건너뛰면 된다 — 억지로 채운 말이 엉뚱한 질의에 걸리는 것보다 낫다.
+
+        provider 에 비전이 없으면 예외가 올라온다. 잡지 않는 게 맞다 — 조용히
+        넘어가면 그림을 안 본 설명이 저장된다.
+
+        provider 마다 받는 형식이 다르다(실측) —
+            gpt / claude   png, jpeg, gif, webp.  bmp 는 400
+            gemini         위에 더해 bmp 도 읽음
+        hwpx 문서 그림은 절반쯤이 bmp 다(243장 중 117장). 그래서 이 용도의 provider 는
+        사실상 gemini 다. 다른 걸 고르면 그 그림들이 통째로 빠진다.
+        """
+        return self._require_llm().describe_image(image, mime_type, provider=provider)
+
+    async def adescribe_image(self, image: bytes, mime_type: str,
+                              provider: str | None = None) -> ImageDescription:
+        """describe_image() 의 async 판."""
+        return await self._require_llm().adescribe_image(image, mime_type,
+                                                         provider=provider)
 
     #------------------------------------------------┌> 축약어 사전
 

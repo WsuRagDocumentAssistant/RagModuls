@@ -33,6 +33,7 @@ provider 이름
 """
 
 import asyncio
+import base64
 import logging
 import re
 import threading
@@ -41,6 +42,7 @@ from typing import Any
 
 from pydantic import BaseModel, ValidationError
 
+from ..models.image_model import ImageDescription
 from ..models.session_model import SessionSummary
 from ..models.vocab_model import QueryTerms, VocabPair, VocabPairs
 from ..prompt import get_prompt
@@ -233,8 +235,8 @@ class LlmService:
 
         logger.info(f"질의 외부 데이터 {external}")
         prov = self._provider(provider)
-        hist = _format_history(history)
-        block, used = _format_contexts(contexts, prov.context_chars)
+        hist, budget = _split_budget(prov, history)
+        block, used = _format_contexts(contexts, budget)
         system, user = get_prompt("answer", context=block, query=query,
                                   external=_format_external(external), history=hist,
                                   summary=_format_summary(summary))
@@ -270,8 +272,8 @@ class LlmService:
             return ""
 
         prov = self._provider(provider)
-        hist = _format_history(history)
-        block, used = _format_contexts(contexts, prov.context_chars)
+        hist, budget = _split_budget(prov, history)
+        block, used = _format_contexts(contexts, budget)
         system, user = get_prompt("refine", context=block, query=query, draft=draft,
                                   external=_format_external(external), history=hist,
                                   summary=_format_summary(summary))
@@ -506,6 +508,60 @@ class LlmService:
         logger.info("재검토: %d개 중 새로 %d개", len(result.pairs), len(fresh))
         return fresh
 
+    async def adescribe_image(self, image: bytes, mime_type: str,
+                              provider: str | None = None) -> ImageDescription:
+        """그림 한 장을 검색 가능한 텍스트로 옮긴다. 색인 때 장당 한 번.
+
+        질의 때는 부르지 않는다. 설명이 이미 텍스트로 저장돼 임베딩까지 끝나 있고,
+        초안을 만드는 로컬 모델은 이미지를 못 받는다.
+
+        세 값(ai_summary / key_facts / key_phrases)을 이어붙여 임베딩하는 걸 전제로
+        프롬프트를 짰다 — 읽기 좋은 글이 아니라 질의와 겹치는 말을 뽑게 한다.
+
+        구조화 출력이라 웹서치는 안 켜진다(asend 가 막는다). 그림을 보고 옮기는
+        일이라 바깥을 볼 이유도 없다.
+
+        provider 에 비전이 없으면 ai-rag-comm 이 예외를 낸다. 여기서 잡지 않는다 —
+        조용히 넘어가면 그림을 안 본 설명이 그럴듯하게 저장된다.
+
+        지원하는 형식이 provider 마다 다르다. 모듈이 미리 거르지 않는 이유가 그것이다
+        — 어디로 보낼지에 따라 되고 안 되고가 갈려서 여기서 판단할 수 없다. 실측:
+            gpt     png / jpeg / gif / webp     bmp 는 400
+            claude  png / jpeg / gif / webp     bmp 는 400
+            gemini  위에 더해 bmp 도 읽음
+        hwpx 문서 그림의 절반쯤이 bmp 였다(243장 중 117장). 그 문서를 다루면 provider
+        선택이 사실상 gemini 로 정해진다.
+
+        설명할 것이 없는 그림(로고·장식)은 세 값이 빈 채로 온다. 부르는 쪽에서
+        걸러 임베딩을 건너뛰면 된다.
+        """
+        if not image:
+            logger.warning("빈 이미지. 설명을 건너뛴다.")
+            return ImageDescription()
+
+        payload = [{"mime_type": mime_type,
+                    "data": base64.b64encode(image).decode("ascii")}]
+        system, user = get_prompt("image_describe")
+        try:
+            result = await self.asend(user, ImageDescription, provider, system=system,
+                                      images=payload)
+        except Exception:
+            # 어느 provider 가 어떤 형식을 거부했는지 남긴다. 예외 메시지만 보면
+            # provider 를 잘못 골랐다는 걸 알아채기 어렵다.
+            logger.error("[%s] 이미지 거부: %s %d바이트 — 이 provider 가 그 형식을 "
+                         "지원하는지 확인하세요(bmp 는 gemini 만 읽습니다)",
+                         provider or self.default, mime_type, len(image))
+            raise
+        if result is None:
+            logger.warning("이미지 설명 실패: %s %d바이트", mime_type, len(image))
+            return ImageDescription()
+
+        logger.info("[%s] 이미지 설명: %s %d바이트 -> 요약 %d자 / 사실 %d개 / 표현 %d개",
+                    provider or self.default, mime_type, len(image),
+                    len(result.ai_summary), len(result.key_facts),
+                    len(result.key_phrases))
+        return result
+
     async def aextract_query_terms(self, query: str, provider: str | None = None) -> list[str]:
         """사용자 질의에 나온 축약어를 뽑는다. 이걸 vocab_short 에서 찾아 확장어를 붙인다."""
         system, user = get_prompt("query_terms", query=query)
@@ -519,7 +575,8 @@ class LlmService:
 
     async def asend(self, prompt: str, schema: type[BaseModel],
                     provider: str | None = None, system: str | None = None,
-                    retries: int = 1) -> BaseModel | None:
+                    retries: int = 1,
+                    images: list[dict] | None = None) -> BaseModel | None:
         """스키마를 강제해 받고 검증한다. 끝까지 실패하면 None.
 
         structured 면 response_format 으로 API 가 형식을 보장한다. 아니면 지시 뒤에
@@ -543,7 +600,8 @@ class LlmService:
 
         name = provider or self.default
         for attempt in range(retries + 1):
-            text = await self.aask(prompt, provider, system=system, response_format=fmt)
+            text = await self.aask(prompt, provider, system=system, response_format=fmt,
+                                   images=images)
             parsed = _extract(schema, text)
             if parsed is not None:
                 return parsed
@@ -553,7 +611,8 @@ class LlmService:
     async def aask(self, prompt: str, provider: str | None = None,
                    system: str | None = None,
                    response_format: dict | None = None,
-                   web_search: bool = False) -> str:
+                   web_search: bool = False,
+                   images: list[dict] | None = None) -> str:
         """채널로 보내고 평문을 받는다.
 
         response_format 에는 '알맹이' JSON Schema 만 넣는다. provider 별 봉투는
@@ -562,6 +621,11 @@ class LlmService:
         web_search 는 기본이 꺼짐이다. 켜면 클라우드 provider 가 웹을 뒤져 답한다
         (로컬은 지원하지 않아 무시된다). response_format 과 함께 쓰면 형식 보장이
         사라지므로 둘을 같이 주지 않는다.
+
+        images 는 [{"mime_type": "image/png", "data": "<base64>"}] 다. provider 별
+        콘텐츠 블록(OpenAI image_url / Claude image+base64)은 ai-rag-comm 이 씌운다.
+        비전을 지원하지 않는 provider 는 그쪽이 예외를 낸다 — 여기서 조용히 버리지
+        않는다. 안 그러면 그림을 안 본 설명이 그럴듯하게 돌아온다.
         """
         if web_search and response_format is not None:
             logger.warning("웹서치와 구조화 출력은 함께 못 씁니다. 웹서치를 끕니다.")
@@ -578,6 +642,8 @@ class LlmService:
             payload["temperature"] = prov.temperature
         if response_format is not None:
             payload["response_format"] = response_format
+        if images:
+            payload["images"] = images
         return await self._channel(prov, web_search).call(payload) or ""
 
 
@@ -627,6 +693,10 @@ class LlmService:
 
     def extract_query_terms(self, query: str, provider: str | None = None) -> list[str]:
         return _run(self.aextract_query_terms(query, provider))
+
+    def describe_image(self, image: bytes, mime_type: str,
+                       provider: str | None = None) -> ImageDescription:
+        return _run(self.adescribe_image(image, mime_type, provider))
 
     def ask(self, prompt: str, provider: str | None = None,
             system: str | None = None, response_format: dict | None = None,
@@ -836,6 +906,28 @@ def _format_contexts(contexts: list, max_chars: int | None = None) -> tuple[str,
         blocks.append(block)
         total += len(block)
     return "\n\n".join(blocks), len(blocks)
+
+
+def _split_budget(prov: _Provider, history: list | None) -> tuple[str, int | None]:
+    """(이전 대화 절, 맥락에 남는 글자). 둘이 예산을 나눠 쓰게 한다.
+
+    따로 자르면 합계가 아무 상한에도 안 걸린다. 맥락 45,000 + 이력 30,000 이면
+    78,000자, 순수 한글로 235KB 다 — 통과를 확인한 지점(80,000자 ≈ 203KB)보다 크다.
+    상한을 올리면서 이 연동을 빼먹어서 생긴 구멍이다.
+
+    이력에 예산의 1/3 까지만 준다. 맥락이 답변의 근거이고 이력은 해석 단서라 우선순위가
+    다르다 — 그렇다고 맥락에 다 주면 이력이 0 이 되어 대명사를 못 푼다. 1/3 이면
+    로컬(45,000)에서 이력 15,000 / 맥락 30,000 이고, 맥락 최악(부모 5개 27,296자)이
+    들어간다.
+
+    prov.context_chars 가 None 이면(클라우드) 예산이 없다. 이력만 HISTORY_CHARS 로
+    자르고 맥락은 제한하지 않는다.
+    """
+    if prov.context_chars is None:
+        return _format_history(history), None
+
+    hist = _format_history(history, min(HISTORY_CHARS, prov.context_chars // 3))
+    return hist, max(0, prov.context_chars - len(hist))
 
 
 def _format_summary(summary: str | None) -> str:
