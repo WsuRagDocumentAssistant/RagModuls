@@ -140,13 +140,16 @@ class RerankerService:
 
         # rerank_text 는 '짧은' 텍스트다(최고점 조각). 승격된 섹션 본문을 넣으면
         # max_length 에서 잘려 앞부분만 보고 판정한다.
-        pairs = [[query, c.rerank_text] for c in contexts]
-        scores = self._model.predict(pairs, batch_size=self.batch_size, show_progress_bar=False)
+        #
+        # 문턱은 여기서 걸지 않고(min_score=None) 점수만 받는다. 걸러진 것에도
+        # rerank_score 를 채워줘야 하기 때문이다 — 부르는 쪽이 '왜 빠졌는지' 를
+        # 점수로 확인한다.
+        scored = self.rerank_texts(query, [c.rerank_text for c in contexts],
+                                   top_k=None, min_score=None)
+        for index, score in scored:
+            contexts[index].rerank_score = score
 
-        for context, score in zip(contexts, scores):
-            context.rerank_score = float(score)
-
-        ordered = sorted(contexts, key=lambda c: c.rerank_score, reverse=True)
+        ordered = [contexts[index] for index, _ in scored]
 
         if min_score is not None:
             kept = [c for c in ordered if c.rerank_score >= min_score]
@@ -161,3 +164,47 @@ class RerankerService:
         if max_per_parent is None:
             return ordered[:top_k]
         return _limit_per_parent(ordered, top_k, max_per_parent)
+
+    def rerank_texts(self, query: str, texts: list[str], top_k: int | None = None,
+                     min_score: float | None = DEFAULT_MIN_SCORE,
+                     ) -> list[tuple[int, float]]:
+        """텍스트 목록에 점수를 매겨 (원래 인덱스, 점수) 를 점수순으로 돌려준다.
+
+        rerank() 가 RetrievedContext 를 전제하는 것과 달리 여기는 문자열만 받는다.
+        DB 에서 dict 로 오는 것(이미지 설명 등)을 리랭킹할 때 껍데기 클래스를 만들지
+        않아도 된다.
+
+        인덱스를 주는 이유: 부르는 쪽은 그 텍스트가 어느 행의 것인지 알아야 하는데,
+        텍스트만 돌려주면 되짚을 수 없다(같은 설명이 두 행에 있을 수 있다).
+
+            for index, score in rerank_texts(query, [r["ai_summary"] for r in rows]):
+                picked.append(rows[index])
+
+        top_k=None 이면 전부 돌려준다. min_score=None 이면 문턱을 안 건다 —
+        rerank() 가 걸러진 것에도 점수를 채워주려고 그렇게 부른다.
+
+        max_per_parent 는 없다. 한 부모의 조각이 자리를 독점하는 걸 막는 값이라
+        맥락 전용이고, 일반 텍스트에는 부모라는 것이 없다.
+
+        min_score 기본값 0.01 은 문서 맥락으로 잰 값이다(무관한 질의 최고점
+        0.000445 의 22배). 다른 종류의 글은 분포가 다를 수 있으니 그때는 직접 재서
+        넘긴다 — 짧은 글일수록 점수가 낮게 깔린다(제목+출처 60자에서 0.5088).
+        """
+        if not texts:
+            return []
+
+        pairs = [[query, text] for text in texts]
+        scores = self._model.predict(pairs, batch_size=self.batch_size,
+                                     show_progress_bar=False)
+
+        ranked = sorted(enumerate(float(s) for s in scores),
+                        key=lambda pair: pair[1], reverse=True)
+
+        if min_score is not None:
+            kept = [pair for pair in ranked if pair[1] >= min_score]
+            if len(kept) != len(ranked):
+                logger.info("점수 미달 버림: %d개 중 %d개 남음 (기준 %.3f, 최고 %.6f)",
+                            len(ranked), len(kept), min_score, ranked[0][1])
+            ranked = kept
+
+        return ranked[:top_k] if top_k is not None else ranked

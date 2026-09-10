@@ -282,6 +282,31 @@ class RagController:
             logger.info("남은 맥락 없음 — 문서와 무관한 질의로 본다")
         return ordered
 
+    def rerank_texts(self, query: str, texts: list[str], top_k: int | None = None,
+                     min_score: float | None = DEFAULT_MIN_SCORE,
+                     ) -> list[tuple[int, float]]:
+        """텍스트 목록을 재정렬한다. (원래 인덱스, 점수) 를 점수순으로.
+
+        rerank() 는 RetrievedContext(rerank_text / rerank_score 속성)를 전제하는데,
+        DB 에서 dict 로 오는 것 — 이미지 설명 같은 — 은 그 모양이 아니다. 그런 것을
+        리랭킹하려고 껍데기 클래스를 만들지 않아도 되게 문자열만 받는다.
+
+            for index, score in rag.rerank_texts(query, [r["ai_summary"] for r in rows],
+                                                 top_k=2):
+                picked.append(rows[index])
+
+        인덱스를 주는 이유는 되짚기다. 텍스트만 돌려주면 어느 행의 것인지 알 수 없고,
+        같은 설명이 두 행에 있으면 구분도 안 된다.
+
+        top_k=None 이면 전부 준다. min_score 기본값은 문서 맥락으로 잰 0.01 이라,
+        다른 종류의 글에는 다시 재서 넘기는 게 맞다 — 짧은 글일수록 점수가 낮게
+        깔린다(제목+출처 60자짜리에서 0.5088 이었다).
+        """
+        logger.info("텍스트 리랭크: %d개 (top_k=%s, 최소 점수 %s)",
+                    len(texts), top_k if top_k is not None else "전부",
+                    min_score if min_score is not None else "없음")
+        return self._reranker.rerank_texts(query, texts, top_k, min_score)
+
     #------------------------------------------------┌> 답변 생성 (선택 의존성)
 
     def answer(self, query: str, contexts: list, provider: str | None = None,
