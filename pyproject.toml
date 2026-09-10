@@ -12,18 +12,12 @@ requires-python = ">=3.11"
 # 리랭커는 sentence-transformers 의 CrossEncoder 를 쓴다. FlagEmbedding 의
 # FlagReranker 는 transformers 5 에서 사라진 API 를 불러 죽어서 뺐다(임베딩용으로는
 # embedded-model 이 알아서 끌어온다).
-#
-# pillow 는 파서가 문서 이미지를 빼낼 때 BMP 를 PNG 로 바꾸는 데만 쓴다. 없어도
-# 돌아간다 — 그때는 BMP 를 그대로 두고 경고만 남긴다. 넣어두는 이유는 실측 때문이다:
-# 문서 하나에서 BMP 39장이 106.6MB 인데(나머지 42장은 합쳐서 7.5MB) 무압축이라
-# 그렇다. 그중 한 장은 base64 로 21MB 가 되어 Gemini 인라인 한도를 넘긴다.
 dependencies = [
     "hwpx @ git+https://github.com/WsuRagDocumentAssistant/HwpxParser_sub.git",
     "embedded-model @ git+https://github.com/zlfm78/TestEmbeddingModelRepository.git",
     "sentence-transformers",
     "psycopg[binary]",
     "pgvector",
-    "pillow",
 ]
 
 # llm_service 만 네트워크를 탄다. 검색만 쓰는 사람이 LLM 스택을 깔 이유가 없어서
