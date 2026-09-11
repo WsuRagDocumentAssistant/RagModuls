@@ -14,7 +14,7 @@ RAG 처리 단계를 메서드로 제공한다.
 import logging
 
 from .models.chunk_model import ChunkedDocument
-from .models.image_model import ImageDescription
+from .models.image_model import DocumentImage, ImageDescription
 from .models.search_model import DEFAULT_MERGE_RATIO, RetrievedContext
 from .models.vocab_model import VocabPair
 from .service.chunker_service import chunk
@@ -142,10 +142,37 @@ class RagController:
     def parse_document(self, file_path: str):
         """hwpx 문서를 구조화된 DocumentModel로 만든다.
 
-        image_dir 가 있으면 문서 이미지도 그 폴더로 빼낸다.
+        image_dir 가 있으면 문서 이미지도 그 폴더로 빼내고, 그 목록을
+        document_images() 로 꺼낼 수 있다.
         """
         logger.info("문서 파싱: %s", file_path)
         return parse(file_path, unpack_dir=self.unpack_dir, image_dir=self.image_dir)
+
+    def document_images(self, parsed) -> list[DocumentImage]:
+        """파싱 결과에서 그림 목록을 꺼낸다. 문서 순서대로.
+
+        image_dir 를 안 주고 파싱했으면 빈 목록이다 — 그림을 빼내지 않았으므로
+        저장 경로가 없다.
+
+            for image in rag.document_images(parsed):
+                db_call("register_image",
+                        image_path=image.path,
+                        display_order=image.order,
+                        caption=image.caption,
+                        major_title=image.heading_path[0] if image.heading_path else None,
+                        mid_title=image.heading_path[1] if len(image.heading_path) > 1 else None,
+                        minor_title=image.heading_path[2] if len(image.heading_path) > 2 else None)
+
+        폴더를 훑는 대신 이걸 쓴다. 폴더 훑기는 이번 문서와 상관없는 파일까지
+        등록한다 — 지난번에 올린 그림이 그대로 남아 있기 때문이다(파싱은 아무것도
+        지우지 않는다).
+
+        caption 은 대개 None 이다. 한글이 그림마다 캡션 자리를 만들어두지만 사용자가
+        채우지 않으면 빈 요소로 남는다(실측한 보고서: 그림 39개 중 <hp:caption> 6개,
+        그 6개도 전부 텍스트 없음). 캡션이 필요하면 describe_image 의 ai_summary 를
+        쓰는 편이 낫다 — 그건 그림을 보고 만든 한 줄 설명이다.
+        """
+        return list(getattr(parsed, "document_images", []))
 
     def chunk_parent_child(self, parsed) -> ChunkedDocument:
         """DocumentModel을 목차 기준 parent/child 청크로 나눈다."""
@@ -495,6 +522,29 @@ class RagController:
     async def ais_image_query(self, query: str, provider: str | None = None) -> bool:
         """is_image_query() 의 async 판. 검색과 함께 gather 할 때 이쪽을 쓴다."""
         return await self._require_llm().ais_image_query(query, provider=provider)
+
+    def vectorize_image(self, image: bytes, mime_type: str,
+                        provider: str | None = None) -> str:
+        """그림을 SVG 마크업으로 다시 그린다. <svg>...</svg> 문자열 하나.
+
+            svg = rag.vectorize_image(data, "image/bmp", provider="gemini")
+            # 그대로 화면에 넣는다. 설명도 코드펜스도 섞이지 않는다.
+
+        실패하면 예외를 올린다. describe_image 는 빈 값을 주지만 여기는 사용자가
+        버튼을 눌러 기다리는 결과라, 조용히 비면 화면이 빈 채로 남는다.
+
+        중간에서 잘린 SVG 도 예외다. 그림이 복잡하면 마크업이 출력 상한을 넘어
+        </svg> 없이 끊기는데, 그대로 넘기면 화면에 아무것도 안 나오고 원인도 안 보인다.
+
+        provider 는 그림을 읽을 수 있어야 한다 — bmp 는 gemini·local_llm 만 받는다.
+        """
+        return self._require_llm().vectorize_image(image, mime_type, provider=provider)
+
+    async def avectorize_image(self, image: bytes, mime_type: str,
+                               provider: str | None = None) -> str:
+        """vectorize_image() 의 async 판."""
+        return await self._require_llm().avectorize_image(image, mime_type,
+                                                          provider=provider)
 
     def describe_image(self, image: bytes, mime_type: str,
                        provider: str | None = None) -> ImageDescription:

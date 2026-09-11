@@ -42,7 +42,7 @@ from typing import Any
 
 from pydantic import BaseModel, ValidationError
 
-from ..models.image_model import ImageDescription, ImageQuery
+from ..models.image_model import ImageDescription, ImageQuery, SvgImage
 from ..models.session_model import SessionSummary
 from ..models.vocab_model import QueryTerms, VocabPair, VocabPairs
 from ..prompt import get_prompt
@@ -52,19 +52,28 @@ logger = logging.getLogger(__name__)
 CLOUD_PROVIDERS = ("gpt", "claude", "gemini")
 LOCAL_PROVIDER = "local_llm"
 
-# RAG 답변은 길다. 맥락 5개(5,000~6,000자)를 근거로 서술하면 답변만 수천 토큰이 되고,
-# 추론 토큰을 먼저 쓰는 모델(gemini)은 한도가 모자라면 content 가 빈 채로 온다
-# (실측: max_tokens=16 에 응답이 None).
-CLOUD_MAX_TOKENS = 8192
+# 출력 상한. 실제로 쓴 만큼만 과금되므로 크게 잡아도 비용이 늘지 않는다. 값을 넉넉히
+# 두는 건 '모자라서 잘리는' 쪽이 '크게 잡아서 손해' 보다 훨씬 나쁘기 때문이다.
+#
+# 65,536 인 이유는 그것이 넷 다 받는 최대값이라서다(실측) —
+#   gpt     65,536 통과 / 131,072 는 400 "max_tokens is too large"
+#   claude  65,536 통과 / 131,072 는 400
+#   gemini  131,072 까지 통과
+#   local   65,536 통과
+#
+# 8,192 로는 실제로 잘렸다. 추론 토큰을 먼저 쓰는 모델(gemini)은 그 예산을 생각에
+# 다 쓰고 정작 답을 낼 자리가 없어진다 — 그림을 SVG 로 옮기는 작업에서 8,192 는
+# 계획하는 글 779자만 남기고 끊겼고, 32,768 을 주니 9,342자짜리 온전한 SVG 가 나왔다.
+# 더 오래된 실측으로는 max_tokens=16 에 content 가 아예 None 이었다.
+#
+# 상한이지 목표가 아니다. 평소 답변은 400~930자(600~1,400 토큰)라 근처도 안 간다.
+CLOUD_MAX_TOKENS = 65536
 
-# 로컬 모델의 출력 상한(≈ 한국어 12,000자). 넘으면 에러가 아니라 문장이 잘린다.
+# 로컬 모델의 출력 상한. 넘으면 에러가 아니라 문장이 잘린다.
 #
 # 예전에는 2,048 이었다. 입력과 출력이 8192 를 나눠 쓰던 시절이라 출력을 묶어야 했다
 # (출력에 다 주면 입력 자리가 0 이 되어 400 이 났다). 컨텍스트가 100k 로 늘어서 그
-# 제약이 사라졌으므로 클라우드와 같은 값으로 맞춘다.
-#
-# 상한이지 목표가 아니다. 실측 초안이 205~609자라 평소에는 근처도 안 간다 — 표가
-# 여럿 붙은 긴 답변에서 잘리지 않게 두는 것이다.
+# 제약이 사라졌으므로 클라우드와 같은 값으로 맞춘다. 65,536 을 받는 것을 확인했다.
 LOCAL_MAX_TOKENS = CLOUD_MAX_TOKENS
 
 # 로컬에 실을 맥락 상한(글자).
@@ -216,8 +225,22 @@ class LlmService:
         한 섹션 안에 비슷한 항목이 여러 개 있을 때(세부과제 2-1 과 2-2 처럼) 구분에도
         쓰인다.
 
-        구조화 출력을 쓰지 않는다. 결과물이 서식(수치에 이탤릭·밑줄)이 붙은 평문이라
-        JSON 스키마로 감싸면 서식과 싸운다. 그래서 웹서치를 켤 수 있다.
+        구조화 출력을 쓰지 않는다. 이유는 웹서치 때문인데, 모델의 제약이 아니라
+        ai-rag-comm 의 미구현이다 — 웹서치를 켜면 gpt 는 Responses API 로 가는데
+        거기서는 response_format 이 아니라 text.format 을 써야 한다. ai-rag-comm 의
+        _responses_kwargs 가 그 변환을 안 하고 경고만 남기며 버린다("웹서치 경로는
+        자유 텍스트 응답을 전제하므로 지금은 지원하지 않는다"). claude·gemini 는
+        그대로 통과한다.
+        OpenAI 자체는 된다 — text.format 으로 직접 부르면 web_search_call 이 돌고
+        응답도 스키마대로 온다(실측, gpt-5.5). 그쪽이 구현하면 이 제약은 사라진다.
+
+        서식 때문은 아니다. 한때 "JSON 스키마로 감싸면 서식과 싸운다" 고 적어뒀는데
+        재보니 아니었다 — reply 필드 하나로 받아도 마크다운 표와 <u><i> 서식이 그대로
+        유지됐다. 잰 적 없는 일반론을 근거처럼 적어둔 것이었다.
+
+        그래서 구조화 출력으로 옮기면 sessionId·sources·이미지 번호를 본문에서
+        파싱하지 않고 필드로 받을 수 있다. gpt 로 웹서치까지 같이 쓰려면
+        ai-rag-comm 쪽 수정이 먼저다.
 
         web_search 기본이 켜짐이다. 맥락에 없는 것을 물으면 모델이 웹에서 찾아
         보완한다. 로컬은 지원하지 않아 무시된다(초안 모델이 로컬이면 자동으로 꺼진다).
@@ -395,8 +418,7 @@ class LlmService:
 
         주제는 같은 호출에서 함께 받는다. 값이 둘이라 구조화 출력을 쓴다 — 평문으로
         받아 "요약:" / "주제:" 를 잘라 쓰면 모델이 형식을 흘릴 때마다 깨진다.
-        웹서치는 asend 가 절대 켜지 않는다(구조화 출력과 함께 못 간다). 있던 대화를
-        줄이는 일이라 어차피 바깥을 볼 이유가 없다.
+        웹서치는 asend 가 끈다. 있던 대화를 줄이는 일이라 어차피 바깥을 볼 이유가 없다.
 
         주제는 '압축한 구간의 주제' 다. 이 메서드가 보는 건 밀려난 차례들뿐이라,
         화제가 막 바뀐 직후에는 이전 주제가 남는다. 부르는 쪽이 알고 쓴다.
@@ -438,9 +460,8 @@ class LlmService:
         예전에는 로컬이 컨텍스트 8192 토큰이라 문서 전체(약 45k)를 못 받았다. 100k 로
         늘어서 이제 들어간다 — 로컬로 돌릴 수 있는지는 다시 재봐야 한다.
 
-        웹서치는 쓰지 않는다. 문서에서 뽑는 작업이라 바깥을 볼 이유가 없고, 웹서치를
-        켜면 ai-rag-comm 이 response_format 을 경고만 남기고 버려서 구조화 출력이
-        깨진다(gemini 는 tools 와 response_schema 를 같이 못 쓴다).
+        웹서치는 쓰지 않는다. 문서에서 뽑는 작업이라 바깥을 볼 이유가 없고, asend 가
+        구조화 출력과 함께 오면 끈다.
         """
         system, user = get_prompt("vocab", text=text)
         result = await self.asend(user, VocabPairs, provider, system=system)
@@ -518,6 +539,58 @@ class LlmService:
         fresh = [p for p in result.pairs if (p.term, p.expansion) not in known]
         logger.info("재검토: %d개 중 새로 %d개", len(result.pairs), len(fresh))
         return fresh
+
+    async def avectorize_image(self, image: bytes, mime_type: str,
+                               provider: str | None = None) -> str:
+        """그림을 SVG 마크업으로 다시 그린다. LLM 한 번.
+
+        돌려주는 건 <svg> 로 시작해 </svg> 로 끝나는 문자열 하나다. 부르는 쪽이
+        그대로 화면에 넣으므로 설명이나 코드펜스가 섞이면 안 된다.
+
+        구조화 출력으로 받는다. 모델이 ```svg 로 감싸거나 "이 그림은 조직도입니다" 를
+        앞에 붙이는 일이 흔한데, asend 가 펜스를 벗기고(_FENCE) 형식이 어긋나면 한 번
+        더 시도한다.
+
+        실패하면 예외다. describe_image 는 빈 값을 돌려주는데 그건 설명이 없으면 그
+        그림만 검색에서 빠지고 마는 일이기 때문이고, 여기는 사용자가 버튼을 눌러
+        기다리는 결과라 조용히 빈 값이 가면 화면이 비어버린다.
+
+        </svg> 로 끝나는지 본다. 출력 상한(8192 토큰 ≈ 한국어 12,000자)에 걸려 잘리면
+        마크업이 중간에서 끊기는데, 그대로 넘기면 화면에 아무것도 안 나오고 원인도
+        안 보인다. 프롬프트에 '베끼지 말라' 를 넣어 길이를 줄였지만 보장은 아니다.
+
+        provider 는 그림을 읽을 수 있어야 한다. bmp 는 gemini 와 local_llm 만 받는다
+        (adescribe_image 의 표 참고).
+        """
+        if not image:
+            raise ValueError("빈 이미지입니다. SVG 로 바꿀 그림이 없습니다.")
+
+        payload = [{"mime_type": mime_type,
+                    "data": base64.b64encode(image).decode("ascii")}]
+        system, user = get_prompt("image_svg")
+        try:
+            result = await self.asend(user, SvgImage, provider, system=system,
+                                      images=payload)
+        except Exception:
+            logger.error("[%s] 이미지 거부: %s %d바이트 — 이 provider 가 그 형식을 "
+                         "지원하는지 확인하세요(bmp 는 gemini·local_llm 만 읽습니다)",
+                         provider or self.default, mime_type, len(image))
+            raise
+
+        svg = (result.svg if result else "").strip()
+        if not svg.startswith("<svg"):
+            raise ValueError(
+                f"SVG 를 받지 못했습니다({provider or self.default}). "
+                f"받은 것: {svg[:80]!r}")
+        if not svg.endswith("</svg>"):
+            raise ValueError(
+                f"SVG 가 중간에 잘렸습니다({len(svg):,}자). 그림이 복잡해 출력 상한에 "
+                f"걸린 것으로 보입니다 — 더 단순한 그림으로 시도하거나 max_tokens 를 "
+                f"올리세요.")
+
+        logger.info("[%s] 이미지 벡터화: %s %d바이트 -> SVG %d자",
+                    provider or self.default, mime_type, len(image), len(svg))
+        return svg
 
     async def ais_image_query(self, query: str, provider: str | None = None) -> bool:
         """그림을 함께 보여줄 질의인지 가른다. LLM 한 번(짧다).
@@ -686,9 +759,15 @@ class LlmService:
         JSON Schema 를 붙이고 평문에서 떼어낸다 — 데이터가 길 때(문서 전체 추출은
         9만 자) 형식 지시가 앞에 있으면 묻히므로 뒤에 붙인다.
 
-        웹서치는 여기서 절대 켜지 않는다. 켜면 ai-rag-comm 이 response_format 을
-        경고만 남기고 버려서 형식 보장이 사라진다(gemini 는 tools 와 response_schema 를
-        같은 요청에 못 쓴다). 구조화 출력과 웹서치는 함께 못 간다.
+        웹서치는 여기서 켜지 않는다. 실측하면 provider 마다 다르다 —
+            gpt     형식이 깨진다. 평문이 온다("오늘 서울은 구름이 많은 날씨입니다...").
+                    모델 제약이 아니라 ai-rag-comm 이 Responses API 의 text.format
+                    으로 옮기지 않고 버리기 때문이다.
+            claude  둘을 같이 써도 JSON 이 그대로 온다.
+            gemini  마찬가지로 온다.
+        gpt 만 막으면 되지만 여기를 쓰는 작업(사전 추출·세션 요약·이미지 설명·질의
+        판정)이 전부 바깥을 볼 이유가 없어서, provider 를 나누지 않고 일괄로 끈다.
+        웹을 봐야 하는 구조화 작업이 생기면 그때 provider 별로 갈라야 한다.
 
         예외로 올리지 않는 이유: 청크 수백 개를 돌리는 중에 하나가 어긋났다고
         전체가 멈출 이유가 없다.
@@ -722,8 +801,15 @@ class LlmService:
         ai-rag-comm 이 씌운다 — 우리가 미리 씌우면 이중으로 감싸져 400 이 난다.
 
         web_search 는 기본이 꺼짐이다. 켜면 클라우드 provider 가 웹을 뒤져 답한다
-        (로컬은 지원하지 않아 무시된다). response_format 과 함께 쓰면 형식 보장이
-        사라지므로 둘을 같이 주지 않는다.
+        (로컬은 지원하지 않아 무시된다).
+
+        response_format 과 함께 주면 웹서치를 끈다. gpt 에서 형식 보장이 사라지기
+        때문인데, OpenAI 의 제약이 아니라 ai-rag-comm 이 Responses API 의 text.format
+        으로 옮기지 않고 버려서 그렇다(claude·gemini 는 둘 다 통과한다). 지금 구조화
+        출력을 쓰는 작업 중 웹을 봐야 하는 것이 없어서 잃는 것이 없다.
+
+        images 와 web_search 는 함께 써도 된다(실측: 세 provider 모두 그림을 읽고
+        웹도 뒤졌다). response_format 과 달리 버려지지 않는다.
 
         images 는 [{"mime_type": "image/png", "data": "<base64>"}] 다. provider 별
         콘텐츠 블록(OpenAI image_url / Claude image+base64)은 ai-rag-comm 이 씌운다.
@@ -731,7 +817,9 @@ class LlmService:
         않는다. 안 그러면 그림을 안 본 설명이 그럴듯하게 돌아온다.
         """
         if web_search and response_format is not None:
-            logger.warning("웹서치와 구조화 출력은 함께 못 씁니다. 웹서치를 끕니다.")
+            logger.warning("구조화 출력과 함께라서 웹서치를 끕니다 "
+                           "(ai-rag-comm 이 gpt 웹서치 경로에서 response_format 을 "
+                           "버립니다)")
             web_search = False
         prov = self._provider(provider)
         payload: dict[str, Any] = {
@@ -801,6 +889,10 @@ class LlmService:
 
     def is_image_query(self, query: str, provider: str | None = None) -> bool:
         return _run(self.ais_image_query(query, provider))
+
+    def vectorize_image(self, image: bytes, mime_type: str,
+                        provider: str | None = None) -> str:
+        return _run(self.avectorize_image(image, mime_type, provider))
 
     def describe_image(self, image: bytes, mime_type: str,
                        provider: str | None = None) -> ImageDescription:
