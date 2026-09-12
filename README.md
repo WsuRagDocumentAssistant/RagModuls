@@ -70,6 +70,11 @@ payload  = document_to_payload(document)  # ragmodul.util — 저장 프로시�
 파싱·청킹만 필요하면 `RagController` 없이 `ragmodul.parse()` / `ragmodul.chunk()` 를
 직접 부른다. 모델도 DB 도 안 올린다.
 
+`parse()` 는 끝나면서 압축을 푼 자리(`unpack_dir/<문서명>/`)를 지운다. 파서가 푼
+폴더를 알고 있으니 이 문서 것만 정확히 지우고, 부르는 쪽이 `unpack_dir` 을 통째로
+비울 필요가 없다 — 통째로 비우면 같은 순간에 다른 워커가 파싱 중인 산출물까지
+지운다. 파싱이 실패하면 남긴다. 풀린 파일을 보려면 `cleanup=False`.
+
 ### 질의 검색
 
 ```python

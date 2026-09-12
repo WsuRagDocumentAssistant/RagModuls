@@ -7,9 +7,10 @@
 hwpx.run_pipeline()이 depth(제목 계층)/heading_path(제목 경로)/표 구조/
 이미지 위치까지 이미 다 계산해주므로, 여기서는 그걸 호출만 한다.
 
-두 가지만 더 한다.
+세 가지만 더 한다.
   - 라이브러리가 '제외:OCR'로 비워둔 표를 필터 전 원본으로 되살린다.
   - image_dir을 주면 본문 그림 블록의 이미지를 그 폴더로 빼낸다.
+  - 압축을 푼 자리(unpack_dir/<문서명>/)를 지운다. 파싱이 끝나면 볼 일이 없다.
 """
 
 import logging
@@ -24,12 +25,17 @@ logger = logging.getLogger(__name__)
 
 
 def parse(file_path: str, unpack_dir: str = "unpacked", recover_excluded: bool = True,
-          image_dir: str | None = None):
+          image_dir: str | None = None, cleanup: bool = True):
     """hwpx를 DocumentModel로 만든다.
 
     image_dir를 주면 본문 그림 블록(block.figure.image)의 이미지를
-    image_dir/<문서명>/ 으로 복사한다. 안 주면 복사하지 않는다 - 이미지는
-    unpack_dir 안에도 풀려 있으므로 필요한 쪽만 켜면 된다.
+    image_dir/<문서명>/ 으로 복사한다. 안 주면 복사하지 않는다.
+
+    cleanup 이면 압축을 푼 자리(unpack_dir/<문서명>/)를 지운다. 파서가 푼 폴더를
+    알고 있으므로 이 문서 것만 정확히 지운다 - 부르는 쪽이 unpack_dir 을 통째로
+    비우면 같은 순간에 다른 문서를 파싱하는 워커의 산출물까지 지운다. 파싱이
+    실패하면 남긴다. 무엇을 받았는지 열어봐야 하는 경우가 그때다(hwp 를 hwpx 로
+    올려서 zip 이 아니었던 일이 있었다). 풀린 파일을 들여다보려면 cleanup=False.
 
     image_dir를 준 경우 model.document_images 에 DocumentImage 목록이 붙는다.
     저장 경로·문서 순서·제목 경로·캡션이 들어 있어서, 등록할 때 폴더를 훑지 않아도
@@ -44,8 +50,35 @@ def parse(file_path: str, unpack_dir: str = "unpacked", recover_excluded: bool =
     if recover_excluded:
         _recover_excluded_tables(model, result)
     if image_dir:
-        model.document_images = _extract_images(model, image_dir, unpack_dir)
+        model.document_images = _extract_images(model, parser, image_dir, unpack_dir)
+    if cleanup:
+        _remove_unpacked(parser, unpack_dir)
     return model
+
+
+def _remove_unpacked(parser, unpack_dir: str) -> None:
+    """파서가 푼 문서 폴더를 지운다. 못 지워도 파싱을 실패로 만들지 않는다.
+
+    unpack_dir 바깥은 절대 지우지 않는다. 파서가 엉뚱한 경로를 들고 있어도(라이브러리가
+    바뀌어서) 피해가 unpack_dir 안에 갇힌다.
+    """
+    target = getattr(parser, "unpacked_dir_path", None)
+    if target is None:
+        return
+    target = Path(target)
+    root = Path(unpack_dir).resolve()
+    try:
+        inside = target.resolve().is_relative_to(root) and target.resolve() != root
+    except OSError:
+        inside = False
+    if not inside or not target.is_dir():
+        logger.warning("압축 해제분을 안 지운다(unpack_dir 밖이거나 없음): %s", target)
+        return
+    try:
+        shutil.rmtree(target)
+        logger.info("압축 해제분 삭제: %s", target)
+    except OSError as e:
+        logger.warning("압축 해제분 삭제 실패(%s): %s - %s", target, type(e).__name__, e)
 
 
 #------------------------------------------------┌> 이미지
@@ -55,7 +88,7 @@ def parse(file_path: str, unpack_dir: str = "unpacked", recover_excluded: bool =
 _CAPTION_ROLES = frozenset({"캡션", "caption"})
 
 
-def _extract_images(model, image_dir: str, unpack_dir: str) -> list:
+def _extract_images(model, parser, image_dir: str, unpack_dir: str) -> list:
     """본문 그림 블록의 이미지만 복사하고 DocumentImage 목록으로 만든다. 문서 순서대로.
 
     기준은 block.figure.image 다. hwpx 는 hp:pic 이 최상위 문단의 run 바로 아래에
@@ -72,7 +105,8 @@ def _extract_images(model, image_dir: str, unpack_dir: str) -> list:
     경로를 더하면 된다. 지금은 일부러 넣지 않는다.
     """
     blocks = _figure_blocks(model)
-    saved = _save_images(model, [ref for ref, _ in blocks], image_dir, unpack_dir)
+    saved = _save_images(model, [ref for ref, _ in blocks], image_dir,
+                         _unpacked_root(parser, unpack_dir))
     return _collect_images(model, blocks, saved)
 
 
@@ -149,11 +183,12 @@ def _caption_after(blocks: list, index: int) -> str | None:
     return None
 
 
-def _save_images(model, refs: list[str], out_dir: str, unpack_dir: str) -> dict[str, str]:
+def _save_images(model, refs: list[str], out_dir: str,
+                 source_root: Path | None) -> dict[str, str]:
     """refs 에 든 이미지만 out_dir/<문서명>/ 으로 복사하고 {ref: 저장경로}를 돌려준다.
 
-    unpack_dir 안에도 이미지가 있지만 그건 파싱 산출물이라 언제 지워도 되는 곳이다.
-    오래 두고 쓸 이미지는 우리가 정한 곳으로 옮긴다.
+    source_root 는 ImageFile.path('BinData/image1.jpg')의 기준 폴더다. 압축을 푼
+    자리는 parse() 가 끝나며 지우므로, 오래 두고 쓸 이미지는 여기서 옮겨둬야 한다.
 
     문서마다 하위 폴더를 만든다. 이미지 ref가 문서 안에서만 유일해서(image1, image2...)
     문서 두 개를 처리하면 image1.jpg가 서로 덮어쓴다.
@@ -165,7 +200,6 @@ def _save_images(model, refs: list[str], out_dir: str, unpack_dir: str) -> dict[
     target = Path(out_dir) / stem
     target.mkdir(parents=True, exist_ok=True)
 
-    source_root = _unpacked_root(unpack_dir, stem)
     saved, missing = {}, []
     for ref in refs:
         image = model.images.get(ref)
@@ -183,13 +217,20 @@ def _save_images(model, refs: list[str], out_dir: str, unpack_dir: str) -> dict[
     return saved
 
 
-def _unpacked_root(unpack_dir: str, stem: str) -> Path | None:
-    """ImageFile.path의 기준이 되는 폴더를 찾는다.
+def _unpacked_root(parser, unpack_dir: str) -> Path | None:
+    """ImageFile.path('BinData/image1.jpg')의 기준이 되는 폴더.
 
-    path가 'BinData/image1.jpg' 같은 상대경로인데, 그 기준이 되는 폴더를 파서가
-    돌려주지 않는다. 지금은 <unpack_dir>/unpacked/<문서명>/ 이지만 그 규칙에 기대면
-    라이브러리가 바뀔 때 조용히 깨지므로, BinData를 가진 폴더를 찾는다.
+    파서가 BinData 경로(image_dir_path)를 들고 있으므로 그 부모를 쓴다. zip 안에
+    문서 폴더가 한 겹 더 들어간 경우도 파서가 이미 풀어서 잡아둔 값이다.
+
+    그 속성이 없거나 폴더가 없으면(라이브러리가 바뀐 경우) unpack_dir 에서 BinData 를
+    가진 폴더를 찾는 예전 방식으로 떨어진다.
     """
+    bin_dir = getattr(parser, "image_dir_path", None)
+    if bin_dir is not None and Path(bin_dir).is_dir():
+        return Path(bin_dir).parent
+
+    stem = getattr(parser, "filename", "")
     root = Path(unpack_dir)
     candidates = [p.parent for p in root.rglob("BinData") if p.is_dir()] if root.is_dir() else []
     if not candidates:
