@@ -151,6 +151,9 @@ class RagController:
     def document_images(self, parsed) -> list[DocumentImage]:
         """파싱 결과에서 그림 목록을 꺼낸다. 문서 순서대로.
 
+        파싱 결과(DocumentModel)와 청킹 결과(ChunkedDocument) 둘 다 받는다 —
+        chunk() 가 목록을 옮겨 두므로 뒤 단계에서 청킹 결과만 들고 있어도 된다.
+
         image_dir 를 안 주고 파싱했으면 빈 목록이다 — 그림을 빼내지 않았으므로
         저장 경로가 없다.
 

@@ -53,6 +53,11 @@ class ParentChunk:
 class ChunkedDocument:
     file: Any                          # hwpx FileInfo (파서가 준 것 그대로)
     parents: list[ParentChunk] = field(default_factory=list)
+    # parse(image_dir=...) 가 뽑은 그림 목록(DocumentImage). chunk() 가 파싱 결과에서
+    # 그대로 옮긴다. 큐로 한 작업씩 오가는 구조라 뒤 단계(이미지 등록)가 파싱 결과를
+    # 다시 볼 수 없어서다 — file 을 들고 다니는 것과 같은 이유다.
+    # image_dir 를 안 주고 파싱했으면 빈 목록이다.
+    document_images: list = field(default_factory=list)
 
     def children(self) -> list[ChildChunk]:
         """임베딩·저장처럼 평탄한 목록이 필요할 때 쓴다."""

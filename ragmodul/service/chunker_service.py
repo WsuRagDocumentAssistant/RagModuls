@@ -67,7 +67,10 @@ def chunk(parsed) -> ChunkedDocument:
     entries = _with_paths(blocks)
     parents: list[ParentChunk] = []
     _split_group(entries, prefix_len=1, parents=parents, seq=[0])
-    return ChunkedDocument(file=parsed.file, parents=parents)
+    # 그림 목록은 파싱 결과에 붙어 있는데 여기서 새 객체를 만들면 떨어진다. 뒤 단계
+    # (이미지 등록)가 ChunkedDocument 만 받으므로 함께 옮긴다.
+    return ChunkedDocument(file=parsed.file, parents=parents,
+                           document_images=list(getattr(parsed, "document_images", [])))
 
 
 def _with_paths(blocks):

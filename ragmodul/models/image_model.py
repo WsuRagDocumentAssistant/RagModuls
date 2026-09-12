@@ -32,8 +32,8 @@ class DocumentImage:
     ref: str                                # 문서 안에서의 이름. 예: 'image10'
     path: str                               # 실제로 저장된 경로
     # 문서 전체에서 몇 번째 블록인가. 목록 정렬용.
-    # 표 셀 안의 그림은 블록이 없어 진짜 위치를 모른다 - 그때는 맨 뒤 번호를 이어
-    # 붙여서 목록 끝에 몰리게 한다. heading_path 가 비어 있으면 그 경우다.
+    # 본문 그림 블록(block.figure.image)만 담으므로 늘 진짜 위치다. 표 셀 안·묶음
+    # 개체 안의 그림은 목록에 넣지 않는다(parser_service._extract_images 참고).
     order: int
     section: int = 0
     media_type: str | None = None
