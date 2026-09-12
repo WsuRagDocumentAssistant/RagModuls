@@ -12,6 +12,7 @@ RAG 처리 단계를 메서드로 제공한다.
 """
 
 import logging
+import threading
 
 from .models.chunk_model import ChunkedDocument
 from .models.image_model import DocumentImage, ImageDescription
@@ -101,6 +102,18 @@ class RagController:
             device=device,
             use_fp16=use_fp16,
         )
+        # GPU 를 쓰는 메서드(임베딩·리랭크)를 직렬화한다. 한 프로세스에서 업로드
+        # (child 수백 개 임베딩)와 질의(임베딩+리랭크)가 스레드로 겹치면 같은 모델에
+        # forward 가 동시에 들어가는데, 그러면 VRAM 이 두 배로 잡히거나 CUDA 쪽에서
+        # 죽는다. 모델 forward 가 도는 구간만 잠그고 그 안에서 DB·LLM 은 부르지 않는다.
+        #
+        # LLM 메서드(answer / refine_all / describe_images_all ...)는 감싸지 않는다.
+        # 전부 네트워크 대기라 GPU 를 안 쓰고, 여기까지 잠그면 업로드 중 질의가 답변
+        # 생성까지 막힌다.
+        #
+        # Lock 이 아니라 RLock 인 이유: 컨트롤러 메서드가 안에서 다른 GPU 메서드를
+        # 부를 때 자기 잠금에 걸려 멈추지 않게. 순차 실행에서는 늘 비어 있어 비용이 없다.
+        self._gpu_lock = threading.RLock()
         # DB 를 어떻게 붙을지 고른다. 둘 다 같은 메서드를 제공하므로 아래 단계들은
         # 무엇이 들어왔는지 모른다.
         #   "manager" — db-manager 의 저장 프로시저를 부른다. 운영은 이쪽이다.
@@ -192,7 +205,8 @@ class RagController:
         실측(child 374개): 530.0초 -> 265.0초. 결과는 완전히 같다.
         """
         children = document.children()
-        result = self._embedder.encode_dense_sparse([c.content for c in children])
+        with self._gpu_lock:
+            result = self._embedder.encode_dense_sparse([c.content for c in children])
 
         for child, vector, weight in zip(children, result.dense, result.sparse):
             child.vector = vector
@@ -221,7 +235,8 @@ class RagController:
         """
         if not texts:
             return []
-        vectors = self._embedder.encode_documents(texts)
+        with self._gpu_lock:
+            vectors = self._embedder.encode_documents(texts)
         logger.info("텍스트 임베딩: %d개 (dense)", len(texts))
         return [to_plain_vector(v) for v in vectors]
 
@@ -260,8 +275,9 @@ class RagController:
             logger.info("질의 임베딩(확장): %s", text)
         else:
             logger.info("질의 임베딩: %s", query)
-        vector = self._embedder.encode_queries([text])[0]
-        weights = self._embedder.encode_sparse([text])[0]
+        with self._gpu_lock:
+            vector = self._embedder.encode_queries([text])[0]
+            weights = self._embedder.encode_sparse([text])[0]
         return vector, weights
 
     def hybrid_search(self, query_vector, query_weights=None, top_k: int = 5) -> list:
@@ -306,8 +322,9 @@ class RagController:
         logger.info("리랭크: %d개 -> top_k=%d (부모당 최대 %s, 최소 점수 %s)",
                     len(contexts), top_k, max_per_parent or "제한없음",
                     min_score if min_score is not None else "없음")
-        ordered = self._reranker.rerank(query, contexts, top_k, max_per_parent,
-                                        min_score)
+        with self._gpu_lock:
+            ordered = self._reranker.rerank(query, contexts, top_k, max_per_parent,
+                                            min_score)
         if not ordered and contexts:
             logger.info("남은 맥락 없음 — 문서와 무관한 질의로 본다")
         return ordered
@@ -335,7 +352,8 @@ class RagController:
         logger.info("텍스트 리랭크: %d개 (top_k=%s, 최소 점수 %s)",
                     len(texts), top_k if top_k is not None else "전부",
                     min_score if min_score is not None else "없음")
-        return self._reranker.rerank_texts(query, texts, top_k, min_score)
+        with self._gpu_lock:
+            return self._reranker.rerank_texts(query, texts, top_k, min_score)
 
     #------------------------------------------------┌> 답변 생성 (선택 의존성)
 
