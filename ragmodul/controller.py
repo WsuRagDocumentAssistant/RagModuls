@@ -360,7 +360,8 @@ class RagController:
     def answer(self, query: str, contexts: list, provider: str | None = None,
                web_search: bool = True, external: list | None = None,
                history: list | None = None, summary: str | None = None,
-               images: list[dict] | None = None) -> str:
+               images: list[dict] | None = None,
+               attachments: list[dict] | None = None) -> str:
         """검색된 맥락으로 답변을 만든다. rerank() 다음 단계다.
 
         web_search 기본이 켜짐이다 — 맥락에 없는 것을 물으면 모델이 웹에서 찾아
@@ -376,28 +377,36 @@ class RagController:
 
         summary 는 창 밖으로 밀려난 대화의 요약이다(summarize_session 이 만든다).
         '## 이전 대화 요약' 절로 따로 내려간다.
+
+        attachments 는 사용자가 질의와 함께 올린 문서다.
+        [{"name", "mime_type": "application/pdf", "data": base64}] 로 주면 모델이
+        통째로 읽는다 — 색인하지 않고 검색도 거치지 않는다. 클라우드 셋(gpt·claude·
+        gemini) 다 받고, 로컬은 지원하지 않는다. images 와 같이 보내도 된다.
         """
         return self._require_llm().answer(query, contexts, provider=provider,
                                           web_search=web_search, external=external,
                                           history=history, summary=summary,
-                                          images=images)
+                                          images=images, attachments=attachments)
 
     async def aanswer(self, query: str, contexts: list, provider: str | None = None,
                       web_search: bool = True, external: list | None = None,
                       history: list | None = None,
                       summary: str | None = None,
-                      images: list[dict] | None = None) -> str:
+                      images: list[dict] | None = None,
+                      attachments: list[dict] | None = None) -> str:
         """answer() 의 async 판. 이미 이벤트 루프 안이면 이쪽을 await 한다."""
         return await self._require_llm().aanswer(query, contexts, provider=provider,
                                                  web_search=web_search,
                                                  external=external, history=history,
-                                                 summary=summary, images=images)
+                                                 summary=summary, images=images,
+                                                 attachments=attachments)
 
     def refine(self, query: str, contexts: list, draft: str,
                provider: str | None = None, web_search: bool = True,
                external: list | None = None, history: list | None = None,
                summary: str | None = None,
-               images: list[dict] | None = None) -> str:
+               images: list[dict] | None = None,
+               attachments: list[dict] | None = None) -> str:
         """다른 모델이 만든 답변 초안을 다듬는다. LLM 한 번.
 
         local_llm 이 초안을 만들고 사용자가 고른 모델이 다듬는 단계다. 고른 모델이
@@ -411,24 +420,29 @@ class RagController:
 
         history 와 summary 는 answer() 와 같다. 초안을 만들 때 준 것과 같은 대화를 줘야,
         대명사와 생략된 대상을 초안이 제대로 짚었는지 다듬는 쪽이 판단할 수 있다.
+
+        attachments 도 초안을 만들 때 준 것과 같은 것을 줘야 한다. 초안이 문서를 보고
+        쓴 내용을 다듬는 쪽이 못 보면 근거 없는 말로 읽고 지운다.
         """
         return self._require_llm().refine(query, contexts, draft, provider=provider,
                                           web_search=web_search, external=external,
                                           history=history, summary=summary,
-                                          images=images)
+                                          images=images, attachments=attachments)
 
     async def arefine(self, query: str, contexts: list, draft: str,
                       provider: str | None = None, web_search: bool = True,
                       external: list | None = None,
                       history: list | None = None,
                       summary: str | None = None,
-                      images: list[dict] | None = None) -> str:
+                      images: list[dict] | None = None,
+                      attachments: list[dict] | None = None) -> str:
         """refine() 의 async 판."""
         return await self._require_llm().arefine(query, contexts, draft,
                                                  provider=provider,
                                                  web_search=web_search,
                                                  external=external, history=history,
-                                                 summary=summary, images=images)
+                                                 summary=summary, images=images,
+                                                 attachments=attachments)
 
     def refine_all(self, query: str, contexts: list, draft: str,
                    providers: list[str], parallel: bool = True,
@@ -436,7 +450,8 @@ class RagController:
                    external: list | None = None,
                    history: list | None = None,
                    summary: str | None = None,
-                   images: list[dict] | None = None) -> dict[str, str]:
+                   images: list[dict] | None = None,
+                   attachments: list[dict] | None = None) -> dict[str, str]:
         """고른 모델들이 같은 초안을 각자 다듬는다. {provider: 다듬은 답변}.
 
         사용자가 한 질의에 모델을 여러 개 골랐을 때 쓰는 단계다. 목록 길이만큼
@@ -447,10 +462,12 @@ class RagController:
 
         하나가 죽어도 나머지는 돌려준다. 실패한 provider 는 결과에 없으니 providers 와
         대조하면 무엇이 빠졌는지 알 수 있다.
+
+        attachments 는 고른 모델 전부에게 같은 것이 간다. 각자 문서를 보고 다듬는다.
         """
         return self._require_llm().refine_all(query, contexts, draft, providers,
                                               parallel, web_search, external,
-                                              history, summary, images)
+                                              history, summary, images, attachments)
 
     async def arefine_all(self, query: str, contexts: list, draft: str,
                           providers: list[str], parallel: bool = True,
@@ -458,12 +475,13 @@ class RagController:
                           external: list | None = None,
                           history: list | None = None,
                           summary: str | None = None,
-                          images: list[dict] | None = None) -> dict[str, str]:
+                          images: list[dict] | None = None,
+                          attachments: list[dict] | None = None) -> dict[str, str]:
         """refine_all() 의 async 판."""
         return await self._require_llm().arefine_all(query, contexts, draft,
                                                      providers, parallel, web_search,
                                                      external, history, summary,
-                                                     images)
+                                                     images, attachments)
 
     def merge(self, question: str, answers: list[str],
               provider: str | None = None) -> str:

@@ -116,6 +116,21 @@ LOCAL_CONTEXT_CHARS = 45000
 # 아니라 목표치다 — 반환값이 이보다 길 수 있다.
 HISTORY_CHARS = 30000
 
+# 한 요청에 실을 수 있는 첨부 크기(base64 기준 바이트). 공식 문서 값에서 여유를 뺐다.
+#
+#   gpt     50MB - 파일 하나든 여럿이든 합계 기준
+#   claude  32MB - 600페이지(컨텍스트 200k 미만 모델은 100페이지)
+#   gemini  50MB / 1000페이지 - 단 인라인(base64)은 '요청 전체' 20MB 가 먼저 걸린다.
+#                              우리는 인라인으로 보내므로 이쪽이 실질 상한이다.
+#
+# base64 는 원본보다 약 33% 크다. 그래서 원본 PDF 기준으로는 gemini 가 약 15MB,
+# claude 24MB, gpt 37MB 다. 문서 폴더에 21MB·14MB 짜리가 있어서 gemini 는 실제로
+# 걸린다 - 보내고 400 을 받는 것보다 미리 막고 이유를 말해주는 게 낫다.
+#
+# gemini 만 프롬프트까지 합쳐 세는 이유는 그 20MB 가 요청 전체이기 때문이다. 나머지
+# 둘은 파일 기준이라 프롬프트를 안 더한다.
+DOC_LIMIT_BYTES = {"gpt": 49_000_000, "claude": 31_000_000, "gemini": 19_000_000}
+
 # temperature 를 보내면 400 이 나는 provider. claude 는 ai-rag-comm 이 경고 후 무시하고,
 # gemini/local 은 정상으로 받는다. gpt 만 모델이 거부한다 —
 # "does not support 0.0 with this model. Only the default (1) value is supported".
@@ -217,7 +232,8 @@ class LlmService:
                       web_search: bool = True, external: list | None = None,
                       history: list | None = None,
                       summary: str | None = None,
-                      images: list[dict] | None = None) -> str:
+                      images: list[dict] | None = None,
+                      attachments: list[dict] | None = None) -> str:
         """검색된 맥락으로 질문에 답한다.
 
         contexts 는 rerank() 를 지난 RetrievedContext 목록이다. 출처(breadcrumb)를
@@ -261,6 +277,10 @@ class LlmService:
         번호를 고르거나 경로를 쓸 일이 없다 — 지어낼 자리가 없다.
         실측으로 웹서치와 함께 써도 문제없다(구조화 출력과 달리 버려지지 않는다).
         지원 형식은 provider 마다 다르다 — adescribe_image 의 표를 본다.
+
+        attachments 는 사용자가 질의와 함께 올린 문서(PDF)다. 검색을 거치지 않고
+        모델이 통째로 읽는다 — 맥락 예산(context_chars)에도 안 들어간다. 클라우드
+        셋 다 받는다(aask 참고). 로컬은 지원하지 않는다.
         """
 
         logger.info(f"질의 외부 데이터 {external}")
@@ -271,7 +291,7 @@ class LlmService:
                                   external=_format_external(external), history=hist,
                                   summary=_format_summary(summary))
         text = await self.aask(user, provider, system=system, web_search=web_search,
-                               images=images)
+                               images=images, attachments=attachments)
         logger.info("[%s] 답변: 맥락 %d개(%d자) -> %d자",
                     provider or self.default, used, len(block), len(text))
         return text
@@ -281,7 +301,8 @@ class LlmService:
                       external: list | None = None,
                       history: list | None = None,
                       summary: str | None = None,
-                      images: list[dict] | None = None) -> str:
+                      images: list[dict] | None = None,
+                      attachments: list[dict] | None = None) -> str:
         """다른 모델이 만든 답변 초안을 Context 와 견주어 고친다.
 
         local_llm 이 초안을 만들고 사용자가 고른 모델이 다듬는 흐름에 쓴다.
@@ -298,6 +319,9 @@ class LlmService:
 
         history 와 summary 는 aanswer 와 같다. 초안을 만든 모델이 본 것과 같은 대화를
         줘야, 대명사와 생략된 대상을 초안이 제대로 짚었는지 다듬는 쪽이 판단할 수 있다.
+
+        attachments 도 초안을 만든 쪽과 같은 것을 줘야 한다. 초안이 문서를 보고 쓴
+        내용을 다듬는 쪽이 못 보면 근거 없는 말로 읽고 지운다.
         """
         if not draft or not draft.strip():
             logger.warning("초안이 비어 있다. 다듬기를 건너뛴다.")
@@ -310,7 +334,7 @@ class LlmService:
                                   external=_format_external(external), history=hist,
                                   summary=_format_summary(summary))
         text = await self.aask(user, provider, system=system, web_search=web_search,
-                               images=images)
+                               images=images, attachments=attachments)
         logger.info("[%s] 다듬기: 초안 %d자 + 맥락 %d개(%d자) -> %d자",
                     provider or self.default, len(draft), used, len(block), len(text))
         return text
@@ -321,7 +345,8 @@ class LlmService:
                           external: list | None = None,
                           history: list | None = None,
                           summary: str | None = None,
-                          images: list[dict] | None = None) -> dict[str, str]:
+                          images: list[dict] | None = None,
+                          attachments: list[dict] | None = None) -> dict[str, str]:
         """고른 모델들이 같은 초안을 각자 다듬는다. {provider: 다듬은 답변}.
 
         하나가 죽어도 나머지는 돌려준다 — 한도(429)나 키 없음으로 한쪽만 실패하는 게
@@ -329,6 +354,9 @@ class LlmService:
         무엇이 빠졌는지 알 수 있다.
 
         같은 provider 가 두 번 들어오면 한 번만 부른다.
+
+        attachments 는 targets 전부에게 같은 것이 간다. 클라우드 셋 다 문서를 받으므로
+        모델을 여럿 골라도 각자 문서를 보고 다듬는다.
 
         초안을 만든 provider 를 여기 넣지 않는 건 부르는 쪽 책임이다. 자기 초안을
         자기가 다듬으면 호출만 하나 늘고 결과는 거의 같다.
@@ -350,7 +378,7 @@ class LlmService:
             # return_exceptions 를 안 켜면 하나가 터질 때 나머지가 취소되고 예외만 올라온다
             results = await asyncio.gather(
                 *(self.arefine(query, contexts, draft, name, web_search, external,
-                               history, summary, images)
+                               history, summary, images, attachments)
                   for name in targets),
                 return_exceptions=True,
             )
@@ -360,7 +388,8 @@ class LlmService:
                 try:
                     results.append(
                         await self.arefine(query, contexts, draft, name, web_search,
-                                           external, history, summary, images))
+                                           external, history, summary, images,
+                                           attachments))
                 except Exception as e:
                     results.append(e)
 
@@ -794,7 +823,8 @@ class LlmService:
                    system: str | None = None,
                    response_format: dict | None = None,
                    web_search: bool = False,
-                   images: list[dict] | None = None) -> str:
+                   images: list[dict] | None = None,
+                   attachments: list[dict] | None = None) -> str:
         """채널로 보내고 평문을 받는다.
 
         response_format 에는 '알맹이' JSON Schema 만 넣는다. provider 별 봉투는
@@ -815,6 +845,22 @@ class LlmService:
         콘텐츠 블록(OpenAI image_url / Claude image+base64)은 ai-rag-comm 이 씌운다.
         비전을 지원하지 않는 provider 는 그쪽이 예외를 낸다 — 여기서 조용히 버리지
         않는다. 안 그러면 그림을 안 본 설명이 그럴듯하게 돌아온다.
+
+        attachments 는 [{"name", "mime_type": "application/pdf", "data": base64}] 다.
+        payload["documents"] 로 나가고 provider 별 블록(claude document / gpt
+        file·input_file / gemini Part)은 ai-rag-comm 이 씌운다. images 와 같이 보내도
+        된다 — 한 요청에 두 블록이 나란히 들어간다.
+
+        한동안 gemini 만 됐다. ai-rag-comm 이 콘텐츠 블록을 이미지로 하드코딩해 둬서
+        PDF 를 넣으면 400 이 났고(gpt: "Invalid MIME type. Only image types are
+        supported.", claude: media_type 거부), gemini 만 Part.from_bytes 라 통했다.
+        그쪽이 documents 를 받게 되면서 풀렸다.
+
+        name 은 gpt 가 filename 으로 쓴다. claude·gemini 는 파일명을 안 받는다.
+
+        크기는 보내기 전에 본다(DOC_LIMIT_BYTES). 넘으면 ValueError 다 — 어느 파일이
+        몇 MB 인지 말해준다. 원본 PDF 기준으로 gemini 약 15MB, claude 24MB,
+        gpt 37MB 가 실질 상한이다.
         """
         if web_search and response_format is not None:
             logger.warning("구조화 출력과 함께라서 웹서치를 끕니다 "
@@ -822,6 +868,7 @@ class LlmService:
                            "버립니다)")
             web_search = False
         prov = self._provider(provider)
+        _check_size(prov, prompt, system, images, attachments)
         payload: dict[str, Any] = {
             "prompt": prompt,
             "model": prov.model,
@@ -835,6 +882,8 @@ class LlmService:
             payload["response_format"] = response_format
         if images:
             payload["images"] = images
+        if attachments:
+            payload["documents"] = attachments
         return await self._channel(prov, web_search).call(payload) or ""
 
 
@@ -843,16 +892,18 @@ class LlmService:
     def answer(self, query: str, contexts: list, provider: str | None = None,
                web_search: bool = True, external: list | None = None,
                history: list | None = None, summary: str | None = None,
-               images: list[dict] | None = None) -> str:
+               images: list[dict] | None = None,
+               attachments: list[dict] | None = None) -> str:
         return _run(self.aanswer(query, contexts, provider, web_search, external,
-                                 history, summary, images))
+                                 history, summary, images, attachments))
 
     def refine(self, query: str, contexts: list, draft: str,
                provider: str | None = None, web_search: bool = True,
                external: list | None = None, history: list | None = None,
-               summary: str | None = None, images: list[dict] | None = None) -> str:
+               summary: str | None = None, images: list[dict] | None = None,
+               attachments: list[dict] | None = None) -> str:
         return _run(self.arefine(query, contexts, draft, provider, web_search,
-                                 external, history, summary, images))
+                                 external, history, summary, images, attachments))
 
     def refine_all(self, query: str, contexts: list, draft: str,
                    providers: list[str], parallel: bool = True,
@@ -860,9 +911,11 @@ class LlmService:
                    external: list | None = None,
                    history: list | None = None,
                    summary: str | None = None,
-                   images: list[dict] | None = None) -> dict[str, str]:
+                   images: list[dict] | None = None,
+                   attachments: list[dict] | None = None) -> dict[str, str]:
         return _run(self.arefine_all(query, contexts, draft, providers, parallel,
-                                     web_search, external, history, summary, images))
+                                     web_search, external, history, summary, images,
+                                     attachments))
 
     def summarize_session(self, previous_summary: str, dropped_turns: list[dict],
                           provider: str | None = None) -> tuple[str, str]:
@@ -1135,6 +1188,40 @@ def _split_budget(prov: _Provider, history: list | None) -> tuple[str, int | Non
 
     hist = _format_history(history, min(HISTORY_CHARS, prov.context_chars // 3))
     return hist, max(0, prov.context_chars - len(hist))
+
+
+def _check_size(prov: _Provider, prompt: str, system: str | None,
+                images: list[dict] | None, attachments: list[dict] | None) -> None:
+    """첨부가 provider 상한을 넘으면 ValueError. 넘지 않으면 아무 일도 안 한다.
+
+    보내고 400 을 받아도 되지만, 그 메시지로는 사용자에게 무엇이 문제인지 못 알려준다
+    (gemini 는 크기 얘기 없이 끊기기도 한다). 여기서 막으면 어느 파일이 몇 MB 라서
+    안 되는지 그대로 말해줄 수 있다.
+
+    상한을 모르는 provider(local_llm 등)는 통과시킨다. 여기서 임의로 막으면 나중에
+    문서를 받게 됐을 때 이유 없이 계속 막힌다.
+    """
+    limit = DOC_LIMIT_BYTES.get(prov.name)
+    if not attachments or limit is None:
+        return
+
+    # gemini 의 20MB 는 요청 전체다. 나머지 둘은 파일 기준이라 글과 그림을 안 더한다.
+    total = sum(len(a.get("data") or "") for a in attachments)
+    if prov.name == "gemini":
+        total += (len(prompt) + len(system or "")
+                  + sum(len(i.get("data") or "") for i in (images or [])))
+    if total <= limit:
+        return
+
+    mb = lambda n: f"{n / 1_048_576:.1f}MB"          # noqa: E731
+    names = ", ".join(
+        f"{a.get('name') or '이름없음'}({mb(len(a.get('data') or ''))})"
+        for a in attachments)
+    raise ValueError(
+        f"파일이 너무 큽니다. {prov.name} 는 한 번에 {mb(limit)}까지 받는데 "
+        f"{mb(total)}를 보내려 했습니다 — {names}. "
+        f"base64 로 보내느라 원본보다 약 33% 커집니다(원본 기준 약 "
+        f"{mb(limit * 3 // 4)}까지). 파일을 나누거나 줄여서 다시 올려 주세요.")
 
 
 def _format_summary(summary: str | None) -> str:
