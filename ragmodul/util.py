@@ -315,3 +315,25 @@ def _in_query(key: str, query: str, norm_query: str) -> bool:
         pattern = rf"(?<![A-Za-z0-9]){re.escape(key)}(?![A-Za-z0-9])"
         return re.search(pattern, query, re.IGNORECASE) is not None
     return _norm(key) in norm_query
+
+
+#------------------------------------------------┌> 출처 표시
+
+# 답변 문장 끝에 붙는 출처 표시. 프롬프트(llm_service._format_contexts/_format_external)와
+# 응답의 출처 목록(RagSystem)이 같은 함수로 만들어야 화면의 각주가 맞는다.
+#   내부 문서(Context) : [a] [b] ... [z] [aa] ...   — 검색 순서대로
+#   외부 데이터        : [1] [2] ...
+
+def context_mark(index: int) -> str:
+    """Context 순번(0부터) -> 'a', 'b', ..., 'z', 'aa', 'ab', ..."""
+    mark = ""
+    index += 1
+    while index:
+        index, rest = divmod(index - 1, 26)
+        mark = chr(ord("a") + rest) + mark
+    return mark
+
+
+def external_mark(index: int) -> str:
+    """외부 데이터 순번(0부터) -> '1', '2', ..."""
+    return str(index + 1)

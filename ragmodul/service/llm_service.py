@@ -46,6 +46,7 @@ from ..models.image_model import ImageDescription, ImageQuery, SvgImage
 from ..models.session_model import SessionSummary
 from ..models.vocab_model import QueryTerms, VocabPair, VocabPairs
 from ..prompt import get_prompt
+from ..util import context_mark, external_mark
 
 logger = logging.getLogger(__name__)
 
@@ -1147,16 +1148,21 @@ def _format_contexts(contexts: list, max_chars: int | None = None) -> tuple[str,
 
     맨 위 하나는 예산을 넘겨도 담는다. 맥락 없이 답하면 모델이 아는 대로 지어내는데,
     차라리 요청이 400/413 으로 실패해서 원인이 보이는 편이 낫다.
+
+    번호는 [a] [b] ... 다(util.context_mark). 모델이 답변 문장 끝에 그대로 붙이고,
+    RagSystem 이 같은 함수로 출처 목록을 만들어 화면 각주와 짝을 맞춘다. 외부 데이터의
+    [1] [2] 와 글자로 구분된다. 예산에 걸려 잘려도 앞에서부터 담으므로 번호는 그대로다.
     """
     blocks: list[str] = []
     total = 0
-    for i, context in enumerate(contexts, 1):
+    for i, context in enumerate(contexts):
+        mark = f"[{context_mark(i)}]"
         if isinstance(context, str):
-            block = f"[{i}]\n{context}"
+            block = f"{mark}\n{context}"
         else:
             source = (getattr(context, "breadcrumb", "")
                       or getattr(context, "heading", "") or "")
-            head = f"[{i}] 출처: {source}" if source else f"[{i}]"
+            head = f"{mark} 출처: {source}" if source else mark
             block = f"{head}\n{getattr(context, 'content', '')}"
 
         if max_chars is not None and blocks and total + len(block) > max_chars:
@@ -1310,20 +1316,24 @@ def _format_external(refs: list | None) -> str:
     source 뿐이다 — url 은 넣지 않는다. 그 API 를 실제로 부르는 건 우리 쪽 일이고,
     모델이 링크를 그대로 답변에 옮기면 사용자가 인증 없이 눌러 실패한다.
     key 와 data 는 애초에 프로시저가 돌려주지 않는다(API 키가 새면 안 된다).
+
+    항목마다 [1] [2] ... 를 붙인다(util.external_mark). 순번은 받은 목록 기준이라 제목이
+    없어 건너뛴 항목도 번호를 차지한다 — RagSystem 의 출처 목록과 어긋나지 않게 한다.
     """
     if not refs:
         return ""
 
     lines = []
-    for ref in refs:
+    for i, ref in enumerate(refs):
+        mark = f"[{external_mark(i)}]"
         if isinstance(ref, str):
-            lines.append(f"- {ref}")
+            lines.append(f"{mark} {ref}")
             continue
         title = (ref.get("title") or "").strip()
         if not title:
             continue
         source = (ref.get("source") or "").strip()
-        lines.append(f"- {title} ({source})" if source else f"- {title}")
+        lines.append(f"{mark} {title} ({source})" if source else f"{mark} {title}")
 
     if not lines:
         return ""

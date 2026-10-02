@@ -40,7 +40,8 @@ from .service.embedded_service import EmbeddedService
 from .service.ocr_service import OcrService
 from .service.parser_service import parse
 from .service.reranker_service import RerankerService
-from .util import document_to_payload, expand_query, filter_vocab_pairs, pack_texts
+from .util import (context_mark, document_to_payload, expand_query, external_mark,
+                   filter_vocab_pairs, pack_texts)
 
 __all__ = [
     # 진입점
@@ -63,4 +64,6 @@ __all__ = [
     "expand_query",          # 질의에 축약어 짝 덧붙이기
     "filter_vocab_pairs",    # 뽑은 축약어 짝 거르기
     "pack_texts",            # 좁은 컨텍스트에 맞춰 글 묶기
+    "context_mark",          # 출처 표시 [a] [b] ... (내부 문서)
+    "external_mark",         # 출처 표시 [1] [2] ... (외부 데이터)
 ]
