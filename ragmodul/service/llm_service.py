@@ -38,7 +38,7 @@ import logging
 import re
 import threading
 from dataclasses import dataclass, field
-from typing import Any
+from typing import Any, Callable
 
 from pydantic import BaseModel, ValidationError
 
@@ -234,7 +234,8 @@ class LlmService:
                       history: list | None = None,
                       summary: str | None = None,
                       images: list[dict] | None = None,
-                      attachments: list[dict] | None = None) -> str:
+                      attachments: list[dict] | None = None,
+                      on_delta: Callable[[str], None] | None = None) -> str:
         """검색된 맥락으로 질문에 답한다.
 
         contexts 는 rerank() 를 지난 RetrievedContext 목록이다. 출처(breadcrumb)를
@@ -292,7 +293,7 @@ class LlmService:
                                   external=_format_external(external), history=hist,
                                   summary=_format_summary(summary))
         text = await self.aask(user, provider, system=system, web_search=web_search,
-                               images=images, attachments=attachments)
+                               images=images, attachments=attachments, on_delta=on_delta)
         logger.info("[%s] 답변: 맥락 %d개(%d자) -> %d자",
                     provider or self.default, used, len(block), len(text))
         return text
@@ -303,7 +304,8 @@ class LlmService:
                       history: list | None = None,
                       summary: str | None = None,
                       images: list[dict] | None = None,
-                      attachments: list[dict] | None = None) -> str:
+                      attachments: list[dict] | None = None,
+                      on_delta: Callable[[str], None] | None = None) -> str:
         """다른 모델이 만든 답변 초안을 Context 와 견주어 고친다.
 
         local_llm 이 초안을 만들고 사용자가 고른 모델이 다듬는 흐름에 쓴다.
@@ -335,7 +337,7 @@ class LlmService:
                                   external=_format_external(external), history=hist,
                                   summary=_format_summary(summary))
         text = await self.aask(user, provider, system=system, web_search=web_search,
-                               images=images, attachments=attachments)
+                               images=images, attachments=attachments, on_delta=on_delta)
         logger.info("[%s] 다듬기: 초안 %d자 + 맥락 %d개(%d자) -> %d자",
                     provider or self.default, len(draft), used, len(block), len(text))
         return text
@@ -347,8 +349,12 @@ class LlmService:
                           history: list | None = None,
                           summary: str | None = None,
                           images: list[dict] | None = None,
-                          attachments: list[dict] | None = None) -> dict[str, str]:
+                          attachments: list[dict] | None = None,
+                          on_delta: Callable[[str, str], None] | None = None) -> dict[str, str]:
         """고른 모델들이 같은 초안을 각자 다듬는다. {provider: 다듬은 답변}.
+
+        on_delta(provider, 조각) 을 주면 각 모델의 답변을 생성되는 대로 흘려보낸다
+        (스트리밍). 반환값은 그대로 완성된 답변이다.
 
         하나가 죽어도 나머지는 돌려준다 — 한도(429)나 키 없음으로 한쪽만 실패하는 게
         흔하다. 실패한 provider 는 결과에 없으므로, 부르는 쪽이 providers 와 대조하면
@@ -375,11 +381,14 @@ class LlmService:
         if not targets:
             return {}
 
+        def delta_for(name):
+            return (lambda text: on_delta(name, text)) if on_delta else None
+
         if parallel:
             # return_exceptions 를 안 켜면 하나가 터질 때 나머지가 취소되고 예외만 올라온다
             results = await asyncio.gather(
                 *(self.arefine(query, contexts, draft, name, web_search, external,
-                               history, summary, images, attachments)
+                               history, summary, images, attachments, delta_for(name))
                   for name in targets),
                 return_exceptions=True,
             )
@@ -390,7 +399,7 @@ class LlmService:
                     results.append(
                         await self.arefine(query, contexts, draft, name, web_search,
                                            external, history, summary, images,
-                                           attachments))
+                                           attachments, delta_for(name)))
                 except Exception as e:
                     results.append(e)
 
@@ -825,8 +834,14 @@ class LlmService:
                    response_format: dict | None = None,
                    web_search: bool = False,
                    images: list[dict] | None = None,
-                   attachments: list[dict] | None = None) -> str:
+                   attachments: list[dict] | None = None,
+                   on_delta: Callable[[str], None] | None = None) -> str:
         """채널로 보내고 평문을 받는다.
+
+        on_delta 를 주면 스트리밍으로 받는다 — 조각이 올 때마다 on_delta(조각)을 부르고,
+        다 받으면 이어 붙인 전체를 돌려준다. 첫 조각 전에 스트리밍이 실패하면 한 번은
+        일반 호출로 다시 받는다(스트리밍만 안 되는 엔드포인트가 있어도 답은 나가게).
+        조각을 흘린 뒤의 실패는 그대로 올린다 — 다시 받으면 화면에 같은 글이 두 번 붙는다.
 
         response_format 에는 '알맹이' JSON Schema 만 넣는다. provider 별 봉투는
         ai-rag-comm 이 씌운다 — 우리가 미리 씌우면 이중으로 감싸져 400 이 난다.
@@ -885,7 +900,10 @@ class LlmService:
             payload["images"] = images
         if attachments:
             payload["documents"] = attachments
-        return await self._channel(prov, web_search).call(payload) or ""
+        channel = self._channel(prov, web_search)
+        if on_delta is None:
+            return await channel.call(payload) or ""
+        return await _stream(channel, payload, on_delta, prov.name)
 
 
     #------------------------------------------------┌> 동기 껍데기
@@ -894,9 +912,10 @@ class LlmService:
                web_search: bool = True, external: list | None = None,
                history: list | None = None, summary: str | None = None,
                images: list[dict] | None = None,
-               attachments: list[dict] | None = None) -> str:
+               attachments: list[dict] | None = None,
+               on_delta: Callable[[str], None] | None = None) -> str:
         return _run(self.aanswer(query, contexts, provider, web_search, external,
-                                 history, summary, images, attachments))
+                                 history, summary, images, attachments, on_delta))
 
     def refine(self, query: str, contexts: list, draft: str,
                provider: str | None = None, web_search: bool = True,
@@ -913,10 +932,11 @@ class LlmService:
                    history: list | None = None,
                    summary: str | None = None,
                    images: list[dict] | None = None,
-                   attachments: list[dict] | None = None) -> dict[str, str]:
+                   attachments: list[dict] | None = None,
+                   on_delta: Callable[[str, str], None] | None = None) -> dict[str, str]:
         return _run(self.arefine_all(query, contexts, draft, providers, parallel,
                                      web_search, external, history, summary, images,
-                                     attachments))
+                                     attachments, on_delta))
 
     def summarize_session(self, previous_summary: str, dropped_turns: list[dict],
                           provider: str | None = None) -> tuple[str, str]:
@@ -1059,6 +1079,27 @@ class LlmService:
 #     "This event loop is already running" 이 난다(실측: 스레드 3개 중 2개 실패).
 #     FastAPI 가 동기 엔드포인트를 스레드풀에 던지는 경우가 그렇다.
 _local = threading.local()
+
+
+async def _stream(channel, payload: dict, on_delta: Callable[[str], None], name: str) -> str:
+    """채널을 스트리밍으로 부르고 조각마다 on_delta 를 부른다. 이어 붙인 전체를 돌려준다."""
+    parts: list[str] = []
+    try:
+        async for text in await channel.call(payload, stream=True):
+            if not text:
+                continue
+            parts.append(text)
+            on_delta(text)
+    except Exception as e:
+        if parts:
+            raise
+        logger.warning("[%s] 스트리밍 실패, 일반 호출로 다시 받는다: %s - %s",
+                       name, type(e).__name__, e)
+        text = await channel.call(payload) or ""
+        if text:
+            on_delta(text)
+        return text
+    return "".join(parts)
 
 
 def _run(coro):

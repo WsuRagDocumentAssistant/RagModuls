@@ -361,8 +361,11 @@ class RagController:
                web_search: bool = True, external: list | None = None,
                history: list | None = None, summary: str | None = None,
                images: list[dict] | None = None,
-               attachments: list[dict] | None = None) -> str:
+               attachments: list[dict] | None = None,
+               on_delta=None) -> str:
         """검색된 맥락으로 답변을 만든다. rerank() 다음 단계다.
+
+        on_delta(조각) 을 주면 답변을 생성되는 대로 흘려보낸다(스트리밍).
 
         web_search 기본이 켜짐이다 — 맥락에 없는 것을 물으면 모델이 웹에서 찾아
         보완한다. 로컬 provider 는 지원하지 않아 무시된다.
@@ -386,7 +389,8 @@ class RagController:
         return self._require_llm().answer(query, contexts, provider=provider,
                                           web_search=web_search, external=external,
                                           history=history, summary=summary,
-                                          images=images, attachments=attachments)
+                                          images=images, attachments=attachments,
+                                          on_delta=on_delta)
 
     async def aanswer(self, query: str, contexts: list, provider: str | None = None,
                       web_search: bool = True, external: list | None = None,
@@ -451,8 +455,11 @@ class RagController:
                    history: list | None = None,
                    summary: str | None = None,
                    images: list[dict] | None = None,
-                   attachments: list[dict] | None = None) -> dict[str, str]:
+                   attachments: list[dict] | None = None,
+                   on_delta=None) -> dict[str, str]:
         """고른 모델들이 같은 초안을 각자 다듬는다. {provider: 다듬은 답변}.
+
+        on_delta(provider, 조각) 을 주면 각 모델의 답변을 생성되는 대로 흘려보낸다(스트리밍).
 
         사용자가 한 질의에 모델을 여러 개 골랐을 때 쓰는 단계다. 목록 길이만큼
         호출한다 — 하나면 1번, 셋이면 3번.
@@ -467,7 +474,8 @@ class RagController:
         """
         return self._require_llm().refine_all(query, contexts, draft, providers,
                                               parallel, web_search, external,
-                                              history, summary, images, attachments)
+                                              history, summary, images, attachments,
+                                              on_delta)
 
     async def arefine_all(self, query: str, contexts: list, draft: str,
                           providers: list[str], parallel: bool = True,
