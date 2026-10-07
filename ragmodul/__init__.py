@@ -38,7 +38,7 @@ from .models.search_model import RetrievedChild, RetrievedContext
 from .service.chunker_service import chunk
 from .service.embedded_service import EmbeddedService
 from .service.ocr_service import OcrService
-from .service.parser_service import parse
+from .service.parser_service import SUPPORTED_SUFFIXES, parse
 from .service.reranker_service import RerankerService
 from .util import (context_mark, document_to_payload, expand_query, external_mark,
                    filter_vocab_pairs, pack_texts)
@@ -55,6 +55,7 @@ __all__ = [
     "RetrievedChild",
     # 단계별로 따로 쓰고 싶을 때
     "parse",
+    "SUPPORTED_SUFFIXES",
     "chunk",
     "EmbeddedService",
     "RerankerService",

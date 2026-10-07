@@ -153,7 +153,7 @@ class RagController:
     #------------------------------------------------┌> 문서 등록
 
     def parse_document(self, file_path: str):
-        """hwpx 문서를 구조화된 DocumentModel로 만든다.
+        """문서(hwpx·docx·xlsx·pdf)를 구조화된 DocumentModel로 만든다.
 
         image_dir 가 있으면 문서 이미지도 그 폴더로 빼내고, 그 목록을
         document_images() 로 꺼낼 수 있다.

@@ -21,7 +21,6 @@ hf-xet==1.6.0
 httpcore==1.0.9
 httpx==0.28.1
 huggingface_hub==1.27.0
-hwpx @ git+https://github.com/WsuRagDocumentAssistant/HwpxParser_sub.git@8056258068dbef1afd46b657f824df6eabda5a7a
 idna==3.18
 ir_datasets==0.6.3
 Jinja2==3.1.6
@@ -69,3 +68,4 @@ tzdata==2026.3
 urllib3==2.7.0
 xxhash==3.8.1
 yarl==1.24.5
+wsu-document-parser @ git+https://github.com/WsuRagDocumentAssistant/Parser.git@202612d852a209c742dd3e815b16ba24092113d8

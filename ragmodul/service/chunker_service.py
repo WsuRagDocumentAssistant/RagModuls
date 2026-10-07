@@ -61,7 +61,7 @@ def _body_text(b):
 
 
 def chunk(parsed) -> ChunkedDocument:
-    """parsed: hwpx DocumentModel (parser_service.parse()의 반환값)."""
+    """parsed: DocumentModel (parser_service.parse()의 반환값. hwpx·docx·xlsx·pdf 공통)."""
     blocks = [b for b in parsed.blocks
               if b.searchable or b.role == "제목" or _heading_text(b) is not None]
     entries = _with_paths(blocks)

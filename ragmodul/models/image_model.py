@@ -33,7 +33,7 @@ class DocumentImage:
     path: str                               # 실제로 저장된 경로
     # 문서 전체에서 몇 번째 블록인가. 목록 정렬용.
     # 본문 그림 블록(block.figure.image)만 담으므로 늘 진짜 위치다. 표 셀 안·묶음
-    # 개체 안의 그림은 목록에 넣지 않는다(parser_service._extract_images 참고).
+    # 개체 안의 그림은 목록에 넣지 않는다(parser_service._keep_images 참고).
     order: int
     section: int = 0
     media_type: str | None = None

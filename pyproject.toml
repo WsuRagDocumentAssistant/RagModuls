@@ -13,7 +13,8 @@ requires-python = ">=3.11"
 # FlagReranker 는 transformers 5 에서 사라진 API 를 불러 죽어서 뺐다(임베딩용으로는
 # embedded-model 이 알아서 끌어온다).
 dependencies = [
-    "hwpx @ git+https://github.com/WsuRagDocumentAssistant/HwpxParser_sub.git",
+    # 문서 파서(hwpx·docx·xlsx·pdf). 예전 hwpx 전용 HwpxParser_sub 를 대체했다(parser_service 설명)
+    "wsu-document-parser @ git+https://github.com/WsuRagDocumentAssistant/Parser.git",
     "embedded-model @ git+https://github.com/zlfm78/TestEmbeddingModelRepository.git",
     "sentence-transformers",
     "psycopg[binary]",
