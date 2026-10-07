@@ -17,19 +17,40 @@ hwpx·docx·xlsx·pdf 를 통합 파서(wsu-document-parser, Parser 저장소)�
   - 그림 파일: 통합 파서는 <image_dir>/<문서명>/images/<SHA-256>.<확장자> 로 저장한다. 이미지
     목록·편집기에 해시가 보이지 않게 예전처럼 <image_dir>/<문서명>/<ref>.<확장자> 로 옮긴다.
   - 그림 목록 타입: ragmodul 의 DocumentImage 로 바꿔 담는다(필드는 같고 클래스만 다르다).
+  - 그림의 제목 경로(이미지 뷰어의 대·중·소제목): 통합 파서는 제목상자를 빼고 세어 얕게 나온다.
+    청커가 단락 breadcrumb 을 만드는 규칙(chunker_service.heading_titles)으로 다시 채운다 — 그림의
+    제목이 그 그림이 든 단락의 제목 경로(답변 출처에 보이는 것)와 늘 같다.
+
+스캔 PDF(글자 층이 없는 페이지)는 통합 파서의 PaddleOCR(PP-OCRv5, CPU)로 읽는다. 아래 PDF_OCR 참고.
 """
 
+import importlib.util
 import logging
+import os
 import shutil
 import tempfile
+import threading
 from pathlib import Path
 
 from ..models.image_model import DocumentImage
+from .chunker_service import heading_titles
 
 logger = logging.getLogger(__name__)
 
 # 통합 파서가 읽는 형식. 업로드 단계가 이 목록으로 먼저 거른다(색인까지 가서 실패하지 않게).
 SUPPORTED_SUFFIXES = (".hwpx", ".docx", ".xlsx", ".pdf")
+
+# PDF OCR 모델. 글자 층이 없는 페이지에서만 돈다(글자가 있는 PDF 는 OCR 없이 읽는다).
+#   korean : 서버 탐지 + 한국어 인식 모델 (기본. 학교 문서가 한국어라서)
+#   server : 서버 탐지 + 서버 인식 모델 (중국어·영어·일본어 — 한국어는 인식 못 한다)
+#   off    : OCR 을 하지 않는다. 스캔 페이지는 본문 없이 들어간다
+# 모델은 처음 OCR 할 때 PADDLE_PDX_CACHE_HOME(기본 ./.cache/paddlex)에 받아 둔다. k8s 는 그 자리를
+# PVC 로 붙여 파드가 다시 떠도 다시 받지 않는다(RagSystem k8s/values.yaml).
+PDF_OCR = os.environ.get("RAG_PDF_OCR", "korean").strip().lower()
+_OCR_MODELS = ("korean", "server")
+
+_ocr = None                       # None: 아직 안 만듦 / False: 쓸 수 없음 / 엔진
+_ocr_lock = threading.Lock()
 
 
 def parse(file_path: str, unpack_dir: str = "unpacked", image_dir: str | None = None):
@@ -52,19 +73,72 @@ def parse(file_path: str, unpack_dir: str = "unpacked", image_dir: str | None = 
         raise ValueError(f"지원하지 않는 문서 형식입니다: {path.suffix or '(확장자 없음)'}. "
                          f"{', '.join(SUPPORTED_SUFFIXES)} 만 등록할 수 있습니다.")
 
+    options = _pdf_options() if path.suffix.lower() == ".pdf" else {}
     if image_dir:
         Path(unpack_dir).mkdir(parents=True, exist_ok=True)
         with tempfile.TemporaryDirectory(dir=unpack_dir) as staging:
-            model = parse_document(path, image_dir=staging)
+            model = parse_document(path, image_dir=staging, **options)
             model.document_images = _keep_images(model, Path(image_dir) / path.stem)
     else:
-        model = parse_document(path)
+        model = parse_document(path, **options)
         model.document_images = []
 
     # 파일명을 제목·저장 키로 쓴다(모듈 설명 참고).
     model.file.title = model.file.filename = path.stem
     logger.info("파싱: %s — 블록 %d개, 그림 %d개", path.name, len(model.blocks), len(model.document_images))
     return model
+
+
+#------------------------------------------------┌> PDF OCR
+
+def _pdf_options() -> dict:
+    """통합 파서에 넘길 PDF 옵션. OCR 을 쓸 수 있으면 엔진을 싣는다."""
+    engine = _ocr_engine()
+    return {"pdf": {"ocr": engine}} if engine else {}
+
+
+def _ocr_engine():
+    """OCR 엔진. 프로세스에 하나만 만든다 — 모델을 올리는 데 몇 초, 메모리도 수백 MB 다.
+
+    OCR 패키지가 없으면 경고 한 번만 남기고 OCR 없이 읽는다. 엔진을 넘기면 스캔 페이지에서
+    파서가 ImportError 로 문서 전체를 실패시키는데, 글자가 있는 페이지까지 버릴 이유가 없다.
+    """
+    global _ocr
+    if PDF_OCR == "off":
+        return None
+    with _ocr_lock:
+        if _ocr is None:
+            model = PDF_OCR if PDF_OCR in _OCR_MODELS else "korean"
+            if model != PDF_OCR:
+                logger.warning("RAG_PDF_OCR=%r 은 알 수 없는 값이다. korean 으로 한다.", PDF_OCR)
+            if importlib.util.find_spec("paddleocr") is None:
+                logger.warning("OCR 패키지(paddleocr)가 없다. 스캔 PDF 는 본문 없이 들어간다 "
+                               "(pip install 'wsu-document-parser[ocr]').")
+                _ocr = False
+            else:
+                from pdf_parser.ocr import PaddleOcr
+                _ocr = _SerialOcr(PaddleOcr(model=model))
+                logger.info("PDF OCR 준비: %s (모델은 처음 쓸 때 내려받는다)", model)
+    return _ocr or None
+
+
+class _SerialOcr:
+    """OCR 엔진을 한 번에 한 페이지씩만 쓰게 한다. 나머지 속성은 엔진 것을 그대로 보인다.
+
+    실행부가 스레드 풀이라 두 문서가 동시에 OCR 할 수 있다. Paddle 추론기는 스레드 안전을
+    보장하지 않고, 동시에 돌면 CPU 메모리도 두 배가 된다. 엔진을 처음 만드는 경합도 막는다.
+    """
+
+    def __init__(self, engine):
+        self._engine = engine
+        self._lock = threading.Lock()
+
+    def __getattr__(self, name):
+        return getattr(self._engine, name)
+
+    def recognize(self, image):
+        with self._lock:
+            return self._engine.recognize(image)
 
 
 #------------------------------------------------┌> 이미지
@@ -104,8 +178,12 @@ def _keep_images(model, target: Path) -> list[DocumentImage]:
             for image in cell.images:
                 image.path = moved.get(image.ref)
 
+    # 그림 블록 자리의 제목 경로. 그림 목록은 블록을 order 로 가리킨다.
+    titles = heading_titles(model.blocks)
+    path_at = {b.order: titles[b.id] for b in model.blocks}
     kept = [DocumentImage(ref=i.ref, path=moved[i.ref], order=i.order, section=i.section,
-                          media_type=i.media_type, heading_path=list(i.heading_path),
+                          media_type=i.media_type,
+                          heading_path=path_at.get(i.order, list(i.heading_path)),
                           caption=i.caption)
             for i in images if i.ref in moved]
     logger.info("이미지 저장: %d개 -> %s (캡션 %d개)", len(kept), target,

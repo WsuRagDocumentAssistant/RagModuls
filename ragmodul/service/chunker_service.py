@@ -73,14 +73,13 @@ def chunk(parsed) -> ChunkedDocument:
                            document_images=list(getattr(parsed, "document_images", [])))
 
 
-def _with_paths(blocks):
-    """각 블록에 (제목상자까지 반영한) 제목 경로를 붙인다.
+def _walk_headings(blocks):
+    """블록을 순서대로 돌며 (블록, 제목이면 그 글 아니면 None, 그 자리의 제목 경로) 를 낸다.
 
-    같은 제목 문구가 문서에 여러 번 나오므로(예: '□ 자율성과지표 정의서')
-    그룹 키는 문구가 아니라 블록 id로 잡는다.
+    경로는 ((블록 id, 제목), ...) 이고, 제목 블록이면 자기 자신까지 들어 있다. 제목상자도
+    제목으로 친다. 단락의 breadcrumb 과 그림의 제목 경로(heading_titles)가 이 한 규칙을 쓴다.
     """
     stack: list[tuple] = []
-    out = []
     for b in blocks:
         heading = _heading_text(b)
         if heading is not None:
@@ -88,11 +87,29 @@ def _with_paths(blocks):
             while stack and stack[-1][0] >= depth:
                 stack.pop()
             stack.append((depth, b.id, heading))
-            text = heading
-        else:
-            text = _body_text(b)
+        yield b, heading, tuple((bid, txt) for _, bid, txt in stack)
+
+
+def heading_titles(blocks) -> dict:
+    """{블록 id: 그 자리의 제목 경로 [제목, ...]}. 단락 breadcrumb 과 같은 규칙이다.
+
+    그림의 대·중·소제목을 여기서 채운다(parser_service). 파서가 블록마다 주는
+    heading_path_text 는 제목상자를 빼고 셀 때가 있어 단락 경로와 어긋난다.
+    """
+    return {b.id: [title for _, title in path] for b, _, path in _walk_headings(blocks)}
+
+
+def _with_paths(blocks):
+    """각 블록에 (제목상자까지 반영한) 제목 경로를 붙인다.
+
+    같은 제목 문구가 문서에 여러 번 나오므로(예: '□ 자율성과지표 정의서')
+    그룹 키는 문구가 아니라 블록 id로 잡는다.
+    """
+    out = []
+    for b, heading, path in _walk_headings(blocks):
+        text = heading if heading is not None else _body_text(b)
         if text:
-            out.append((tuple((bid, txt) for _, bid, txt in stack), text))
+            out.append((path, text))
     return out
 
 
