@@ -20,6 +20,9 @@ hwpx·docx·xlsx·pdf 를 통합 파서(wsu-document-parser, Parser 저장소)�
   - 그림의 제목 경로(이미지 뷰어의 대·중·소제목): 통합 파서는 제목상자를 빼고 세어 얕게 나온다.
     청커가 단락 breadcrumb 을 만드는 규칙(chunker_service.heading_titles)으로 다시 채운다 — 그림의
     제목이 그 그림이 든 단락의 제목 경로(답변 출처에 보이는 것)와 늘 같다.
+  - 엑셀 시트 표: 시트 맨 위의 표 제목·작성자 줄을 머리글로 잡아, 진짜 열 이름(학과명, 취업률 등)이
+    본문 행으로 밀려난다. 행 단위로 쪼갠 청크에 열 이름이 빠져 답변이 "데이터 1 / 지표 1" 처럼
+    숫자만 늘어놨다. 머리글을 다시 찾아 표를 새로 그린다(아래 '엑셀 시트 표' 참고).
 
 스캔 PDF(글자 층이 없는 페이지)는 통합 파서의 PaddleOCR(PP-OCRv5, CPU)로 읽는다. 아래 PDF_OCR 참고.
 """
@@ -87,11 +90,139 @@ def parse(file_path: str, unpack_dir: str = "unpacked", image_dir: str | None = 
 
     # 파일명을 제목·저장 키로 쓴다(모듈 설명 참고).
     model.file.title = model.file.filename = path.stem
+    if path.suffix.lower() == ".xlsx":
+        _tidy_sheets(model)
     for name in ("created_at", "modified_at"):
         setattr(model.file, name, _to_datetime(getattr(model.file, name, None)))
     logger.info("파싱: %s — 블록 %d개, 그림 %d개", path.name, len(model.blocks), len(model.document_images))
     return model
 
+
+
+
+#------------------------------------------------┌> 엑셀 시트 표
+#
+# 대학알리미·내부 집계 엑셀은 보통 이렇게 생겼다.
+#
+#   졸업생의 취업 현황 (대학)                       <- 표 제목 (한 칸을 가로로 병합)
+#   작성자 | 류신환 | 확인자 | 류신환 | 최종확인일자 | 2026-01-06   <- 작성 정보
+#   계열 | 학과명 | 취업률(%)          | 유지취업률(%)      <- 머리글 1행 (세로·가로 병합)
+#        |        | 전체 | 남 | 여 ... | 1차 | 2차 ...      <- 머리글 2행
+#   공학 | 컴퓨터공학과 | 89.4 | ...                       <- 데이터
+#
+# 통합 파서는 첫 행(표 제목)을 머리글로 그린다. 병합 칸을 칸마다 되풀이해 제목이 열 개 넘게 반복되고,
+# 청커가 표를 행 단위로 자를 때 매 조각에 붙이는 머리글도 그 제목줄이 된다 — 진짜 열 이름은 첫 조각에만
+# 남는다. 그래서 여기서 표를 다시 그린다.
+#   - 표 제목·작성 정보 줄은 표 밖의 문장으로 뺀다. 표 제목은 시트 제목(답변 출처 이름)으로도 쓴다.
+#   - 머리글 여러 행은 열마다 한 줄로 합친다("취업률(%) 전체"). 청커가 매 조각에 머리글을 붙인다.
+#   - 엑셀이 저장한 이진 소수(89.40000000000001)는 엑셀 화면처럼 15자리로 줄인다.
+# 머리글을 못 찾으면 통합 파서가 그린 표를 그대로 둔다.
+
+_DEFAULT_SHEET = re.compile(r"^(sheet|시트)\s*\d*$", re.IGNORECASE)
+_NUMBER = re.compile(r"^[+-]?(\d+(\.\d*)?|\.\d+)([eE][+-]?\d+)?%?$")
+HEADER_FILL = 0.6        # 머리글 행은 열의 이만큼 이상이 차 있다(작성 정보 줄은 띄엄띄엄이다)
+MAX_SHEET_CELLS = 100_000  # 통합 파서가 희소 표로 따로 그리는 크기. 그런 표는 건드리지 않는다
+
+
+def _tidy_sheets(model) -> None:
+    """xlsx 의 시트 표를 머리글이 매 조각에 붙는 모양으로 다시 그린다. 시트 제목도 표 제목으로."""
+    headings = {b.id: b for b in model.blocks if b.role == "제목"}
+    for block in model.blocks:
+        table = getattr(block, "table", None)
+        if table is None or not table.cells or table.rows * table.cols > MAX_SHEET_CELLS:
+            continue
+        tidy = _sheet_markdown(table)
+        if tidy is None:
+            continue
+        title, notes, markdown = tidy
+        # 시트 이름이 기본값(Sheet1)이면 답변 출처에 "Sheet1" 만 보인다. 표 제목으로 바꾼다.
+        # 이름을 지어 둔 시트는 그 이름을 살린다("2025 (졸업생의 취업 현황)"). 제목으로 올린 줄은
+        # 본문에서 뺀다(단락 제목과 같은 줄이 두 번 나온다).
+        heading = headings.get((block.heading_path or [None])[-1])
+        if title and heading is not None and heading.text:
+            sheet = heading.text.strip()
+            heading.text = title if _DEFAULT_SHEET.match(sheet) else f"{sheet} ({title})"
+            notes = [line for line in notes if line != title]
+        table.markdown = "\n".join(notes) + "\n\n" + markdown if notes else markdown
+
+
+def _sheet_markdown(table):
+    """표 -> (표 제목, 머리글 위 줄들, 마크다운 표). 머리글 행을 못 찾으면 None."""
+    rows, cols = table.rows, table.cols
+    grid = [[""] * cols for _ in range(rows)]
+    origin = [[None] * cols for _ in range(rows)]   # 병합 칸이 어느 칸에서 시작했는지
+    spans = {}
+    for cell in table.cells:
+        text = _cell_text(cell.text)
+        spans[(cell.row, cell.col)] = (cell.row_span or 1, cell.col_span or 1)
+        for r in range(cell.row, min(rows, cell.row + (cell.row_span or 1))):
+            for c in range(cell.col, min(cols, cell.col + (cell.col_span or 1))):
+                grid[r][c], origin[r][c] = text, (cell.row, cell.col)
+
+    filled = [sum(1 for v in row if v) for row in grid]
+
+    def is_header(r):
+        # 열의 HEADER_FILL 이상이 차 있고, 아래 데이터 행만큼(한 칸 빈 모서리는 봐준다) 차 있어야 한다.
+        # 작성 정보 줄("작성자 | 홍길동 | 최종확인일자 | 2026-01-06")은 열이 적은 표에서 비율을 넘기도
+        # 해서, 바로 아래 행들보다 덜 찼으면 머리글이 아니다.
+        starts = {origin[r][c] for c in range(cols) if grid[r][c]}
+        below = [n for n in filled[r + 1:] if n][:3]
+        return (len(starts) >= 2 and filled[r] >= cols * HEADER_FILL
+                and filled[r] >= max(below, default=0) - 1)
+
+    top = next((r for r in range(rows) if is_header(r)), None)
+    if top is None or top == rows - 1:
+        return None
+    # 머리글은 첫 머리글 행의 세로 병합이 끝나는 데까지. 세로 병합이 없어도 가로 병합(묶음 열 이름)
+    # 아래 숫자 없는 행이 이어지면 그 행은 하위 열 이름이다.
+    bottom = max(top + spans.get(origin[top][c], (1, 1))[0] - 1 for c in range(cols) if origin[top][c])
+    while (bottom + 1 < rows - 1 and any(spans.get(origin[bottom][c], (1, 1))[1] > 1 for c in range(cols))
+           and not any(_NUMBER.match(v) for v in grid[bottom + 1]) and is_header(bottom + 1)):
+        bottom += 1
+
+    header = []
+    for c in range(cols):
+        names = []
+        for r in range(top, bottom + 1):
+            if grid[r][c] and grid[r][c] not in names:
+                names.append(grid[r][c])
+        header.append(" ".join(names))
+    body = [row for row in grid[bottom + 1:] if any(row)]
+    if not body:
+        return None
+
+    # 머리글 위 줄: 한 칸짜리는 표 제목, 여러 칸이면 "작성자: 류신환 · 확인자: ..." 처럼 키·값으로 편다.
+    title, notes = "", []
+    for r in range(top):
+        values = [grid[r][c] for c in range(cols) if grid[r][c] and origin[r][c] == (r, c)]
+        if not values:
+            continue
+        if len(values) == 1:
+            title = title or values[0]
+            notes.append(values[0])
+        elif len(values) % 2 == 0:
+            notes.append(" · ".join(f"{k}: {v}" for k, v in zip(values[::2], values[1::2])))
+        else:
+            notes.append(" · ".join(values))
+
+    lines = [_md_row(header), "| " + " | ".join("---" for _ in range(cols)) + " |"]
+    lines += [_md_row(row) for row in body]
+    return title, notes, "\n".join(lines)
+
+
+def _cell_text(text) -> str:
+    """칸 글자. 이진 소수 꼬리(89.40000000000001)는 엑셀 화면처럼 15자리로 줄인다."""
+    text = " ".join(str(text or "").split())
+    if _NUMBER.match(text) and not text.endswith("%"):
+        try:
+            return f"{float(text):.15g}"
+        except ValueError:
+            pass
+    return text
+
+
+def _md_row(values) -> str:
+    return "| " + " | ".join(v.replace("|", "\|") for v in values) + " |"
 
 
 #------------------------------------------------┌> 파일 날짜
