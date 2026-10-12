@@ -27,9 +27,11 @@ hwpx·docx·xlsx·pdf 를 통합 파서(wsu-document-parser, Parser 저장소)�
 import importlib.util
 import logging
 import os
+import re
 import shutil
 import tempfile
 import threading
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
 from ..models.image_model import DocumentImage
@@ -85,8 +87,49 @@ def parse(file_path: str, unpack_dir: str = "unpacked", image_dir: str | None = 
 
     # 파일명을 제목·저장 키로 쓴다(모듈 설명 참고).
     model.file.title = model.file.filename = path.stem
+    for name in ("created_at", "modified_at"):
+        setattr(model.file, name, _to_datetime(getattr(model.file, name, None)))
     logger.info("파싱: %s — 블록 %d개, 그림 %d개", path.name, len(model.blocks), len(model.document_images))
     return model
+
+
+
+#------------------------------------------------┌> 파일 날짜
+
+# PDF 날짜: D:YYYYMMDDHHmmSS 뒤에 시간대(Z / +09'00' / -05'00). 날짜 뒤 자리는 빠질 수 있다.
+_PDF_DATE = re.compile(r"D:(\d{4})(\d{2})?(\d{2})?(\d{2})?(\d{2})?(\d{2})?"
+                       r"(?:(Z)|([+-])(\d{2})'?(\d{2})?'?)?")
+
+
+def _to_datetime(value):
+    """파서가 준 작성·수정일을 datetime 으로 바꾼다. 읽을 수 없으면 None.
+
+    통합 파서는 메타데이터 문자열을 그대로 준다 — docx·hwpx 는 ISO("2022-07-18T09:02:59Z"),
+    PDF 는 PDF 표준 형식("D:20220718180259+09'00'"). PDF 형식이 그대로 색인 프로시저에
+    가면 DB 가 날짜로 못 읽어(DatetimeFieldOverflowError) 문서 등록 전체가 실패했다.
+    날짜는 부가 정보라, 못 읽는 값은 버리고(None) 등록은 계속한다.
+    """
+    if value is None or isinstance(value, datetime):
+        return value
+    text = str(value).strip()
+    if not text:
+        return None
+    try:
+        match = _PDF_DATE.fullmatch(text)
+        if match:
+            year, month, day, hour, minute, second, utc, sign, tz_h, tz_m = match.groups()
+            tz = None
+            if utc:
+                tz = timezone.utc
+            elif sign:
+                offset = timedelta(hours=int(tz_h), minutes=int(tz_m or 0))
+                tz = timezone(offset if sign == "+" else -offset)
+            return datetime(int(year), int(month or 1), int(day or 1), int(hour or 0),
+                            int(minute or 0), int(second or 0), tzinfo=tz)
+        return datetime.fromisoformat(text.replace("Z", "+00:00"))
+    except ValueError:
+        logger.warning("파일 날짜를 읽지 못해 비웁니다: %r", text)
+        return None
 
 
 #------------------------------------------------┌> PDF OCR
