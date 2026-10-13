@@ -34,7 +34,6 @@ import re
 import shutil
 import tempfile
 import threading
-from contextlib import contextmanager
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
@@ -312,28 +311,8 @@ class _SerialOcr:
         return getattr(self._engine, name)
 
     def recognize(self, image):
-        with self._lock, _keep_root_logging():
+        with self._lock:
             return self._engine.recognize(image)
-
-
-@contextmanager
-def _keep_root_logging():
-    """안에서 바뀐 루트 로거 레벨·핸들러를 되돌린다.
-
-    PaddleX 3.3.x 는 첫 OCR 때 추론기를 올리며 paddle 을 import 하는데, 그때 루트 로거 레벨이
-    WARNING 으로 바뀐다(paddlex 3.7 의 import_guard 가 같은 것을 막는다). 실행부 프로세스 전체에
-    걸리므로 그 뒤로 functions·ragmodul 의 INFO 로그가 하나도 안 찍혔다 — 기동 때
-    warm_viewer_sections 가 스캔 PDF 를 파싱하면 서버가 뜨자마자 그렇게 된다(로컬 재현).
-    """
-    root = logging.getLogger()
-    level, handlers = root.level, list(root.handlers)
-    try:
-        yield
-    finally:
-        root.setLevel(level)
-        for handler in root.handlers[:]:
-            if handler not in handlers:
-                root.removeHandler(handler)
 
 
 #------------------------------------------------┌> 이미지
