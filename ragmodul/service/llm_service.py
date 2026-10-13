@@ -1353,8 +1353,9 @@ def _format_external(refs: list | None) -> str:
     빈 문자열을 돌려주는 게 중요하다. 제목만 있고 내용이 없는 '## 참고 가능한 외부
     데이터' 가 남으면 모델이 그 빈칸을 설명하려 든다.
 
-    dict 목록을 받는다(search_api_data_vector 의 결과 그대로). 쓰는 키는 title 과
-    source 뿐이다 — url 은 넣지 않는다. 그 API 를 실제로 부르는 건 우리 쪽 일이고,
+    dict 목록을 받는다(search_api_data_vector 의 결과 그대로). 쓰는 키는 title·source 와
+    추가 정보(provider·base_year·description — RagSystem 이 붙여 준다. 없으면 뺀다)다.
+    제목만으로는 어느 해·어떤 데이터인지 모델이 알 수 없다. url 은 넣지 않는다. 그 API 를 실제로 부르는 건 우리 쪽 일이고,
     모델이 링크를 그대로 답변에 옮기면 사용자가 인증 없이 눌러 실패한다.
     key 와 data 는 애초에 프로시저가 돌려주지 않는다(API 키가 새면 안 된다).
 
@@ -1373,8 +1374,12 @@ def _format_external(refs: list | None) -> str:
         title = (ref.get("title") or "").strip()
         if not title:
             continue
-        source = (ref.get("source") or "").strip()
-        lines.append(f"{mark} {title} ({source})" if source else f"{mark} {title}")
+        year = ref.get("base_year")
+        about = [part for part in ((ref.get("source") or "").strip(), (ref.get("provider") or "").strip(),
+                                   f"{year}년 기준" if year else "") if part]
+        line = f"{mark} {title} ({', '.join(about)})" if about else f"{mark} {title}"
+        description = (ref.get("description") or "").strip()
+        lines.append(f"{line} — {description}" if description else line)
 
     if not lines:
         return ""
