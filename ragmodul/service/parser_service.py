@@ -71,21 +71,18 @@ def parse(file_path: str, unpack_dir: str = "unpacked", image_dir: str | None = 
     표 셀 안의 그림은 목록에 넣지 않는다(예전과 같다). 그 파일은 임시 폴더와 함께 지워지므로
     셀의 그림 참조(table.cells[].images)에는 경로가 없다.
     """
-    from document_parser import parse as parse_document
-
     path = Path(file_path)
     if path.suffix.lower() not in SUPPORTED_SUFFIXES:
         raise ValueError(f"지원하지 않는 문서 형식입니다: {path.suffix or '(확장자 없음)'}. "
                          f"{', '.join(SUPPORTED_SUFFIXES)} 만 등록할 수 있습니다.")
 
-    options = _pdf_options() if path.suffix.lower() == ".pdf" else {}
     if image_dir:
         Path(unpack_dir).mkdir(parents=True, exist_ok=True)
         with tempfile.TemporaryDirectory(dir=unpack_dir) as staging:
-            model = parse_document(path, image_dir=staging, **options)
+            model = _run_parser(path, staging)
             model.document_images = _keep_images(model, Path(image_dir) / path.stem)
     else:
-        model = parse_document(path, **options)
+        model = _run_parser(path, None)
         model.document_images = []
 
     # 파일명을 제목·저장 키로 쓴다(모듈 설명 참고).
@@ -122,6 +119,7 @@ _DEFAULT_SHEET = re.compile(r"^(sheet|시트)\s*\d*$", re.IGNORECASE)
 _NUMBER = re.compile(r"^[+-]?(\d+(\.\d*)?|\.\d+)([eE][+-]?\d+)?%?$")
 HEADER_FILL = 0.6        # 머리글 행은 열의 이만큼 이상이 차 있다(작성 정보 줄은 띄엄띄엄이다)
 MAX_SHEET_CELLS = 100_000  # 통합 파서가 희소 표로 따로 그리는 크기. 그런 표는 건드리지 않는다
+MAX_SHEET_CHARS = 5_000_000  # 병합 칸을 펼친 뒤의 글자 수 상한
 
 
 def _tidy_sheets(model) -> None:
@@ -130,6 +128,11 @@ def _tidy_sheets(model) -> None:
     for block in model.blocks:
         table = getattr(block, "table", None)
         if table is None or not table.cells or table.rows * table.cols > MAX_SHEET_CELLS:
+            continue
+        # 병합 칸은 덮는 자리마다 글자를 채우므로(_sheet_markdown) 그만큼을 미리 세어 상한을 넘으면
+        # 손대지 않는다 — 큰 글자를 넓게 병합한 칸 하나로 메모리를 크게 잡을 수 있다.
+        expanded = sum(len(c.text or "") * (c.row_span or 1) * (c.col_span or 1) for c in table.cells)
+        if expanded > MAX_SHEET_CHARS:
             continue
         tidy = _sheet_markdown(table)
         if tidy is None:
@@ -263,6 +266,97 @@ def _to_datetime(value):
         return None
 
 
+#------------------------------------------------┌> 파서 격리
+#
+# 통합 파서(Parser 저장소)는 다른 분이 관리한다. 보안 점검에서 작은 문서 하나로 파서가 메모리를
+# 수 GB 쓰거나(병합 셀·공유 문자열 반복, 네임스페이스 복사, 도형 메타 복사) 정규식에 오래 묶이는
+# 경우가 나왔다(resource-exhaustion.* / regular-expression-denial-of-service). 파서를 고치기
+# 전까지 여기서 막는다 — 파서를 별도 프로세스에서 돌려
+#   - 시간이 PARSE_TIMEOUT 을 넘으면 그 프로세스를 죽이고 실패로 돌려준다
+#   - 메모리가 터지면 커널이 그 프로세스만 죽인다(oom_score_adj 1000 — 실행부·모델보다 먼저)
+#   - 결과 글자 수가 MAX_PARSED_CHARS 를 넘으면 돌려보내기 전에 거절한다
+# 실행부 프로세스(임베딩·리랭커 모델이 올라간 곳)는 다치지 않는다.
+#
+# OCR 엔진도 그 프로세스 안에서 만든다(프로세스 사이로 엔진 객체를 넘길 수 없다). 덤으로 PaddleX 가
+# 첫 OCR 때 루트 로거 레벨을 바꾸던 일도 실행부 로그에 영향을 주지 않게 됐다.
+
+PARSE_TIMEOUT = int(os.environ.get("RAG_PARSE_TIMEOUT_SECONDS", "900"))
+PARSE_WORKERS = int(os.environ.get("RAG_PARSE_WORKERS", "2"))
+MAX_PARSED_CHARS = int(os.environ.get("RAG_MAX_PARSED_CHARS", str(50_000_000)))
+
+_pool = None
+_pool_lock = threading.Lock()
+
+
+def _run_parser(path: Path, image_dir: str | None):
+    """파서 프로세스에서 문서를 읽어 DocumentModel 을 받아 온다. 시간 초과·프로세스 죽음은 ValueError."""
+    from concurrent.futures import TimeoutError as FutureTimeout
+    from concurrent.futures.process import BrokenProcessPool
+
+    pool = _parser_pool()
+    ocr = PDF_OCR if path.suffix.lower() == ".pdf" else None
+    future = pool.submit(_parse_in_child, str(path), image_dir, ocr)
+    try:
+        return future.result(timeout=PARSE_TIMEOUT)
+    except FutureTimeout:
+        _reset_pool(pool)
+        raise ValueError(f"문서를 읽는 데 {PARSE_TIMEOUT}초를 넘겨 중단했습니다. 문서 구조를 확인해 주세요.")
+    except BrokenProcessPool:
+        _reset_pool(pool)
+        raise ValueError("문서를 읽다가 메모리가 부족해 중단했습니다. 문서 구조(병합 셀·표 크기)를 확인해 주세요.")
+
+
+def _parser_pool():
+    global _pool
+    with _pool_lock:
+        if _pool is None:
+            import multiprocessing
+            from concurrent.futures import ProcessPoolExecutor
+
+            _pool = ProcessPoolExecutor(max_workers=PARSE_WORKERS, initializer=_child_init,
+                                        mp_context=multiprocessing.get_context("spawn"))
+        return _pool
+
+
+def _reset_pool(broken) -> None:
+    """멈춘(또는 죽은) 파서 프로세스를 정리하고 다음 요청 때 새로 띄우게 한다."""
+    global _pool
+    with _pool_lock:
+        if _pool is not broken:
+            return
+        _pool = None
+    for process in list((getattr(broken, "_processes", None) or {}).values()):
+        try:
+            process.kill()
+        except Exception:                                  # noqa: BLE001
+            pass
+    broken.shutdown(wait=False, cancel_futures=True)
+
+
+def _child_init() -> None:
+    """파서 프로세스 시작. 메모리가 모자라면 커널이 이 프로세스를 먼저 죽이게 한다(리눅스)."""
+    try:
+        with open("/proc/self/oom_score_adj", "w") as f:
+            f.write("1000")
+    except OSError:
+        pass
+
+
+def _parse_in_child(path: str, image_dir: str | None, ocr: str | None):
+    """(파서 프로세스) 문서 -> DocumentModel. 결과 글자 수가 상한을 넘으면 ValueError."""
+    from document_parser import parse as parse_document
+
+    options = _pdf_options() if ocr else {}
+    model = (parse_document(Path(path), image_dir=image_dir, **options) if image_dir
+             else parse_document(Path(path), **options))
+    chars = sum(len(getattr(b, "text", None) or "") for b in model.blocks)
+    chars += sum(len(t.markdown or "") for t in model.tables())
+    if chars > MAX_PARSED_CHARS:
+        raise ValueError(f"문서에서 나온 글자가 너무 많습니다({chars:,}자, 최대 {MAX_PARSED_CHARS:,}자). "
+                         "병합 셀이나 반복되는 값이 많은 표가 있는지 확인해 주세요.")
+    return model
+
+
 #------------------------------------------------┌> PDF OCR
 
 def _pdf_options() -> dict:
@@ -317,19 +411,51 @@ class _SerialOcr:
 
 #------------------------------------------------┌> 이미지
 
+# 문서 하나에서 저장하는 그림 개수·총 크기 상한.
+MAX_IMAGES = int(os.environ.get("RAG_MAX_IMAGES_PER_DOCUMENT", "2000"))
+MAX_IMAGE_BYTES = int(os.environ.get("RAG_MAX_IMAGE_BYTES_PER_DOCUMENT", str(500 * 1024 * 1024)))
+_UNSAFE_NAME = re.compile(r"[^0-9A-Za-z_-]+")
+
+
+def _safe_stem(ref, used: set) -> str:
+    """문서 안의 그림 id -> 파일 이름(확장자 없이). 글자·숫자·_- 만, 겹치면 번호를 붙인다."""
+    stem = _UNSAFE_NAME.sub("_", str(ref or "")).strip("_")[:80] or "image"
+    name, n = stem, 1
+    while name.lower() in used:
+        n += 1
+        name = f"{stem}_{n}"
+    used.add(name.lower())
+    return name
+
+
+def _safe_suffix(suffix: str) -> str:
+    suffix = (suffix or "").lower()
+    return suffix if re.fullmatch(r"\.[0-9a-z]{1,5}", suffix) else ".bin"
+
+
 def _keep_images(model, target: Path) -> list[DocumentImage]:
     """임시 폴더에 받은 본문 그림을 target/<ref>.<확장자> 로 옮기고 DocumentImage 목록을 만든다.
 
     같은 그림이 문서에 여러 번 놓이면 통합 파서가 파일 하나를 같이 쓰므로 한 번만 옮긴다.
     모델 안의 경로(model.images, 그림 블록의 image.path)도 옮긴 자리로 바꾼다 — 그렇지 않으면
     임시 폴더가 지워진 뒤 없는 경로를 가리킨다.
+
+    파일 이름의 ref 는 문서 안의 값(HWPX manifest id 등)이라 그대로 쓰지 않는다. 예전에는
+    "../../app/x" 같은 id 를 넣은 문서로 이미지 폴더 밖 파일을 만들거나 덮어쓸 수 있었다(보안 점검
+    path-traversal.hwpx-image-persistence). 글자·숫자·_- 만 남기고, 최종 경로가 target 안인지 확인한다.
+    여러 id 가 같은 원본 파일을 가리키면 한 번만 복사하고, 개수·총 크기에도 상한을 둔다
+    (같은 그림을 수천 번 복사시키는 문서 — resource-exhaustion.xlsx-shared-string-output).
     """
     images = list(getattr(model, "document_images", None) or [])
     if not images:
         return []
     target.mkdir(parents=True, exist_ok=True)
+    root = target.resolve()
 
     moved: dict[str, str] = {}                  # ref -> 옮긴 경로
+    by_source: dict[str, str] = {}              # 원본 파일 -> 옮긴 경로 (같은 파일을 여러 id 가 가리킬 때)
+    used: set[str] = set()
+    total = 0
     for image in images:
         if image.ref in moved:
             continue
@@ -337,9 +463,22 @@ def _keep_images(model, target: Path) -> list[DocumentImage]:
         if not source.is_file():
             logger.warning("그림 파일이 없다: %s (%s)", image.ref, source)
             continue
-        dest = target / f"{image.ref}{source.suffix.lower()}"
+        key = str(source.resolve())
+        if key in by_source:
+            moved[image.ref] = by_source[key]
+            continue
+        size = source.stat().st_size
+        if len(by_source) >= MAX_IMAGES or total + size > MAX_IMAGE_BYTES:
+            logger.warning("그림이 너무 많거나 커서 나머지는 저장하지 않는다(%d개, %d바이트까지)",
+                           MAX_IMAGES, MAX_IMAGE_BYTES)
+            break
+        dest = (root / f"{_safe_stem(image.ref, used)}{_safe_suffix(source.suffix)}").resolve()
+        if dest.parent != root:
+            logger.warning("그림 이름이 올바르지 않아 건너뜀: %r", image.ref)
+            continue
         shutil.copy2(source, dest)
-        moved[image.ref] = str(dest)
+        total += size
+        moved[image.ref] = by_source[key] = str(dest)
 
     for ref, saved in model.images.items():
         saved.path = moved.get(ref, "")

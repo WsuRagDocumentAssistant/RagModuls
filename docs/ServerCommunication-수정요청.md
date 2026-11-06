@@ -26,7 +26,7 @@ def __init__(self, api_key: str, default_model: str):
 
 ```
 POST http://117.16.166.22/v1/chat/completions
-headers: {"x-user-id": "npark-01"}
+headers: {"x-user-id": "<LOCAL_LLM_HEADERS 환경변수로>"}
 model:   gemma-4-12B-it
 ```
 

@@ -24,6 +24,7 @@ from ..models.chunk_model import ChildChunk, ChunkedDocument, ParentChunk
 
 MAX_PARENT_CHARS = 5000
 CHILD_CHUNK_SIZE = 500
+MAX_CRUMB_CHARS = 300   # 조각 앞에 붙이는 제목 경로 상한
 
 # 표를 만나면 크기와 무관하게 청크를 끊어 표를 독립 청크로 만든다.
 # 표 조각이 본문 조각과 검색 순위를 다투다 밀리는 것을 막는다.
@@ -151,11 +152,13 @@ def _emit(content: str, heading, breadcrumb: str, parents: list, seq: list) -> N
         heading=heading, breadcrumb=breadcrumb,
     )
     seq[0] += 1
+    # 조각마다 붙는 제목 경로는 길이를 제한한다 — 아주 긴 제목이 모든 조각에 복사되지 않게.
+    crumb = breadcrumb if len(breadcrumb) <= MAX_CRUMB_CHARS else breadcrumb[:MAX_CRUMB_CHARS] + "…"
     # breadcrumb를 자른 뒤에 붙이므로 그만큼 미리 빼둬야 최종 길이가 한도를 지킨다.
-    room = max(CHILD_CHUNK_SIZE - len(breadcrumb) - 1, 100)
+    room = max(CHILD_CHUNK_SIZE - len(crumb) - 1, 100)
     for piece in _split_text(content, room):
         parent.children.append(ChildChunk(
-            id=f"child::{seq[0]}", content=_with_context(piece, breadcrumb),
+            id=f"child::{seq[0]}", content=_with_context(piece, crumb),
         ))
         seq[0] += 1
     parents.append(parent)
@@ -248,6 +251,12 @@ def _split_table(markdown: str, size: int) -> list[str]:
     header, body = _header_body(lines)
     if not body:
         return ["\n".join(header)]
+    # 머리글이 조각 크기의 절반을 넘으면 반복하지 않고 줄 단위로만 자른다. 반복하면 행마다
+    # 거대한 머리글이 통째로 복사돼, 작은 문서 하나가 수 GB 를 잡을 수 있었다(보안 점검
+    # resource-amplification-repeated-table-header). 이 경우 조각에 열 이름이 빠지는 대신
+    # 전체 출력이 입력 크기를 넘지 않는다.
+    if len("\n".join(header)) > size // 2:
+        return [part for line in lines for part in _wrap(line, size)]
 
     out: list[str] = []
     buf: list[str] = []

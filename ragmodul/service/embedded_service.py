@@ -11,8 +11,6 @@ device를 넘기지 않으면 가중치가 CPU에 남고 연산할 때만 GPU로
 
 import logging
 
-from embedded import BGEM3Model
-
 logger = logging.getLogger(__name__)
 
 
@@ -35,6 +33,9 @@ class EmbeddedService:
         self._logged_device = False
 
         logger.info("임베딩 초기화 진행 (device=%s)", device or "자동")
+        # 여기서 불러온다 — 패키지를 import 만 하는 곳(문서 파서 프로세스 등)이 torch 를 올리지 않게.
+        from embedded import BGEM3Model
+
         self._model = BGEM3Model(
             model_path,
             device=device,
