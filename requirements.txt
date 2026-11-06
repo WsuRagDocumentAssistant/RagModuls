@@ -68,4 +68,4 @@ tzdata==2026.3
 urllib3==2.7.0
 xxhash==3.8.1
 yarl==1.24.5
-wsu-document-parser @ git+https://github.com/WsuRagDocumentAssistant/Parser.git@202612d852a209c742dd3e815b16ba24092113d8
+wsu-document-parser @ git+https://github.com/WsuRagDocumentAssistant/Parser.git@70287c92ca104e536d0c81154d38cc91183bc7e0
