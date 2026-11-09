@@ -81,21 +81,18 @@ payload  = document_to_payload(document)  # ragmodul.util — 저장 프로시�
 query = "교원 확보율은 얼마인가?"
 qvec, qweights = rag.embed_query(query, vocab)     # vocab 은 load_vocab() 결과. None 이면 확장 안 함
 hits     = db_call("search_documents_hybrid", ...)  # 조각. 넉넉히(40개) 뽑는다
-contexts = rag.build_contexts(hits)                 # LLM 입력 단위로 묶기
-contexts = rag.rerank(query, contexts, top_k=5)     # 최종 순서
+contexts = rag.rerank(query, hits, top_k=5)         # 조각 리랭크 → 서로 다른 부모 5개
 ```
 
-`hits` 는 `parent_id / child_content / content / breadcrumb / similarity /
-parent_child_count` 를 가진 dict 목록이다. `parent_child_count` 가 승격 비율의
-분모다 — 없으면 걸린 조각 수로 대체되어 전부 승격된다.
+`hits` 는 `parent_id / child_content / content(부모 본문) / breadcrumb / similarity`
+를 가진 dict 목록이다. 검색 결과를 그대로 넘긴다.
 
-`build_contexts` 에 `limit` 을 걸지 말 것. 약한 신호(유사도)로 미리 자른 뒤 강한
-신호(리랭커)에게 남은 것만 주면 정답이 잘린다 — 실측으로 recall 이 93%에서 83%로
-떨어졌다. 후보를 다 넘기고 리랭커가 `top_k` 로 줄이게 한다.
+`hits` 를 미리 자르지 말 것. 약한 신호(유사도)로 자른 뒤 강한 신호(리랭커)에게
+남은 것만 주면 정답이 잘린다 — 실측으로 recall 이 93%에서 83%로 떨어졌다. 후보를
+다 넘기고 리랭커가 고르게 한다.
 
-`rerank` 는 부모당 최대 2개(`max_per_parent`)만 담고, 점수 0.01 미만
-(`min_score`)은 버린다. 문서와 무관한 질의면 빈 목록이 나오므로 부르는 쪽이 맥락
-없이 답하는 경우를 처리해야 한다.
+`rerank` 는 점수 0.01 미만(`min_score`) 조각을 버린다. 문서와 무관한 질의면 빈
+목록이 나오므로 부르는 쪽이 맥락 없이 답하는 경우를 처리해야 한다.
 
 ### 답변 생성
 
@@ -260,27 +257,29 @@ child에는 목차 경로(breadcrumb)가 앞에 붙는다. 조각만 봐도 어�
 
 ### 검색: RetrievedContext
 
-검색은 조각 단위지만 LLM에 넣는 건 섹션 본문이다. 조각을 그대로 돌려주면 같은
-섹션에서 여러 조각이 걸릴 때 본문이 여러 번 실려간다(실측: 조각 10개가 섹션 2곳,
-본문의 56%가 중복).
-
-그래서 **비율로 판단한다**:
+조각으로 찾고, 조각으로 리랭크하고, 부모 본문으로 넘긴다(small-to-big).
 
 ```
-걸린 조각 수 / 그 부모의 전체 조각 수 > 0.5   →  섹션 본문으로 승격 (merged=True)
-                                      ≤ 0.5   →  조각 그대로 (merged=False)
+검색 조각 40개 → 조각마다 리랭크 → 점수순으로 내려가며 처음 보는 부모를 담는다
+              → 서로 다른 부모 top_k 개, 각각 본문 전체 (RetrievedContext)
 ```
 
-16개 중 2개만 걸린 섹션에 5000자를 붙이는 건 과하므로 조각만 준다.
-[LlamaIndex AutoMergingRetriever](https://github.com/run-llama/llama_index/blob/main/llama-index-core/llama_index/core/retrievers/auto_merging_retriever.py)와 같은 방식이다.
+- 리랭커에는 **짧은 조각**을 넣는다. 부모 본문(수천 자)을 넣으면 512 토큰에서 잘려
+  앞부분만 보고 판정한다.
+- 같은 부모의 조각이 여럿 상위에 들어도 부모 하나로 모인다. 본문이 두 번 실려가지
+  않고(예전 실측: 조각 10개가 섹션 2곳, 본문의 56%가 중복), 한 부모가 자리를
+  독점하지도 않는다.
+- 부모 순서는 **그 부모의 최고 조각 순서**다. 합으로 하면 조각이 많은 큰 부모를
+  편들고, 평균으로 하면 많이 걸릴수록 낮은 형제가 섞여 깎인다(실측: 평균으로 했다가
+  recall 93%→83%).
+- `children`은 그 부모에서 상위에 든 조각들이고 리랭크 점수순이다. `rerank_text`
+  (= `children[0]`)가 '맞은 부분'이다. 자리가 찬 뒤에도 이미 뽑힌 부모의 조각은
+  계속 모은다.
 
-`score`는 **걸린 조각 중 최고점**이다. 평균이 아니다 — 평균으로 했다가 recall이
-93%에서 83%로 떨어졌다. 승격되는 섹션은 조각이 많이 걸린 섹션인데, 많이 걸릴수록
-평균에 딸려오는 낮은 형제도 많아져 점수가 내려간다. 관련성이 높을수록 벌을 받는
-구조였다.
-
-`rerank_text`는 최고점 조각이다. 승격된 섹션 본문(수천 자)을 리랭커에 넣으면
-512 토큰에서 잘려 앞부분만 보고 판정한다.
+예전에는 리랭크 **전에** 비율(걸린 조각 수 / 부모의 조각 수 > 0.5)로 본문 승격을
+정했다(LlamaIndex AutoMergingRetriever 방식). 그러면 리랭커가 정답 조각을 1위로
+올려도 비율을 못 넘긴 부모는 500자 조각으로만 나갔고, 조각이 많은 큰 부모일수록
+그랬다. 그래서 기준을 '리랭크 상위에 들었나' 하나로 바꿨다.
 
 ---
 
@@ -319,7 +318,7 @@ sparse 차원은 하드코딩하지 않고 모델에게 묻는다(`rag.sparse_di
 | dense 단독, 조각 5개 | 93% | 0.892 |
 | + sparse (RRF) | 93% | 0.883 |
 | + 리랭크 | 90% | **0.900** |
-| + 맥락 조립 (현재 기본) | 90% | **0.900** |
+| + 맥락 조립 (예전 비율 승격) | 90% | **0.900** |
 
 단계별 차이:
 
@@ -331,6 +330,10 @@ sparse 차원은 하드코딩하지 않고 모델에게 묻는다(`rag.sparse_di
 위의 3%p 차이는 잡음과 구분되지 않는다. 확실한 건 맥락 조립이 recall을 깎지 않고
 문맥을 크게 줄인다는 것뿐이다.
 
+지금 방식(리랭크 상위 조각의 부모 본문)은 따로 재지 않았다. 부모 범위와 각 부모의
+내용이 예전 방식과 같거나 넓으므로 검색 recall 은 떨어지지 않는다. 대신 LLM 입력이
+조각 대신 부모 본문이라 위의 3,401자보다 커진다.
+
 ---
 
 ## 알려진 한계
@@ -340,11 +343,6 @@ HwpxParser_sub 를 2026-10-07 에 대체했다. 같은 문서로 비교해 제�
 것을 확인했다(제목 수 RISE 319/319, 2주기 206/202). 문서 제목은 파일명으로, 그림 파일명은
 `<ref>.<확장자>` 로 `parse()` 가 맞춘다(parser_service 설명). 그림의 제목 경로는 아직
 2단계까지만 나온다 — 이미지 뷰어의 소제목이 빌 수 있다(Parser 쪽 수정 대기).
-
-**승격 비율 `0.5`는 검증되지 않았다.** LlamaIndex 기본값이다. 문서 1개로 튜닝하면
-그 문서에 맞추는 것밖에 안 된다. 비율의 분모는 부모당 조각 수이고 그건 청킹 설정
-(`MAX_PARENT_CHARS`, 표 분할 규칙)이 정하므로, 지금 맞춘 값은 문서와 설정 양쪽에
-묶인다. `merge_ratio` 인자로 받으므로 문서가 늘면 코드 없이 바꿀 수 있다.
 
 **이미지 설명은 실패와 '설명할 것 없음' 이 구분되지 않는다.** `describe_images_all`
 은 둘 다 빈 `ImageDescription` 을 돌려준다. 둘 다 임베딩을 건너뛰면 되는 경우라
@@ -385,7 +383,7 @@ ragmodul/
 ├─ util.py                    순수 계산 — 사전 선별, 질의 확장, 글 묶기, 저장 페이로드 변환
 ├─ models/
 │  ├─ chunk_model.py          ChunkedDocument / ParentChunk / ChildChunk
-│  ├─ search_model.py         RetrievedContext / RetrievedChild (승격 로직)
+│  ├─ search_model.py         RetrievedContext / RetrievedChild (그릇만)
 │  ├─ image_model.py          DocumentImage / ImageDescription / ImageQuery / SvgImage
 │  ├─ session_model.py        SessionSummary
 │  └─ vocab_model.py          VocabPair / VocabPairs / QueryTerms

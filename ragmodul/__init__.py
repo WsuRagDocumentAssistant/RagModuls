@@ -24,12 +24,11 @@ RAG 처리 모듈.
     query = "세부과제 2-2의 추진 내용은?"
     qvec, qweights = rag.embed_query(query)
     hits = rag.hybrid_search(qvec, qweights, top_k=40)   # 조각. 넉넉히 뽑는다
-    contexts = rag.build_contexts(hits)                  # LLM 입력 단위로 묶기
-    contexts = rag.rerank(query, contexts, top_k=5)      # 최종 순서
+    contexts = rag.rerank(query, hits, top_k=5)          # 조각 리랭크 → 서로 다른 부모 5개
 
-build_contexts 에 limit 을 걸지 말 것. 약한 신호(유사도)로 미리 자른 뒤 강한 신호
-(리랭커)에게 남은 것만 주면 정답이 잘린다 — 실측으로 recall 이 93%에서 83%로
-떨어졌다. 후보를 다 넘기고 리랭커가 top_k 로 줄이게 한다.
+hits 를 미리 자르지 말 것. 약한 신호(유사도)로 자른 뒤 강한 신호(리랭커)에게
+남은 것만 주면 정답이 잘린다 — 실측으로 recall 이 93%에서 83%로 떨어졌다. 후보를
+다 넘기고 리랭커가 고르게 한다.
 """
 
 from .controller import RagController

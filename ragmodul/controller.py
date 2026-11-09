@@ -16,14 +16,13 @@ import threading
 
 from .models.chunk_model import ChunkedDocument
 from .models.image_model import DocumentImage, ImageDescription
-from .models.search_model import DEFAULT_MERGE_RATIO, RetrievedContext
+from .models.search_model import RetrievedChild, RetrievedContext
 from .models.vocab_model import VocabPair
 from .service.chunker_service import chunk
 from .service.db_service import DbService
 from .service.embedded_service import EmbeddedService
 from .service.parser_service import parse
-from .service.reranker_service import (DEFAULT_MAX_PER_PARENT, DEFAULT_MIN_SCORE,
-                                       RerankerService)
+from .service.reranker_service import DEFAULT_MIN_SCORE, RerankerService
 from .util import (DEFAULT_PACK_CHARS, expand_query, filter_vocab_pairs, pack_texts,
                    to_plain_vector)
 
@@ -288,46 +287,64 @@ class RagController:
         logger.info("검색: top_k=%d (%s)", top_k, "hybrid" if query_weights else "dense")
         return self._require_db().search_hybrid(query_vector, query_weights, top_k)
 
-    def build_contexts(self, hits: list, merge_ratio: float = DEFAULT_MERGE_RATIO,
-                       limit: int | None = None) -> list[RetrievedContext]:
-        """검색된 조각을 LLM 입력 단위로 묶는다.
+    def rerank(self, query: str, hits: list[dict], top_k: int = 3,
+               min_score: float | None = DEFAULT_MIN_SCORE) -> list[RetrievedContext]:
+        """검색된 조각을 리랭크하고, 상위 조각의 부모 top_k 개를 본문으로 돌려준다.
 
-        조각이 merge_ratio 이상 걸린 섹션만 본문으로 승격한다. 조금 걸린 섹션은
-        조각 그대로 둔다 — 같은 본문이 여러 번 실려가는 걸 막고(실측: 본문의 56%가
-        중복), 2/16 만 걸린 섹션에 수천 자를 붙이는 낭비도 없다.
+        hits 는 hybrid_search() 결과(조각 행) 그대로다. 미리 자르지 않는다 — 약한
+        신호(유사도)로 자른 뒤 리랭커에게 남은 것만 주면 정답이 잘린다(실측: recall
+        93%->83%). 수십 개 리랭크는 GPU 에서 무료에 가깝다.
 
-        limit 은 기본으로 걸지 않는다. 약한 신호(유사도)로 미리 자른 뒤 강한 신호
-        (리랭커)에게 남은 것만 주는 건 순서가 거꾸로다. 실제로 limit=10 을 걸었다가
-        정답이 잘려 recall 이 93%->83% 로 떨어졌다. 리랭크 비용은 후보 수에 비례하지만
-        수십 개는 GPU 에서 무료에 가깝다.
+        1. 조각마다 리랭크한다. 부모 본문을 넣으면 max_length 에서 잘려 앞부분만 보고
+           판정하므로 짧은 조각을 쓴다.
+        2. 점수순으로 내려가며 처음 보는 부모를 자리에 넣는다. 자리가 찬 뒤에도 이미
+           뽑힌 부모의 조각은 계속 모은다(출처 화면의 인용문).
+        3. 부모마다 본문 하나로 넘긴다.
+
+        예전에는 리랭크 '전에' 비율(걸린 조각 / 부모의 조각 > 0.5)로 본문 승격을
+        정했다. 그러면 리랭커가 정답 조각을 1위로 올려도 비율을 못 넘긴 부모는 조각으로만
+        나갔다 — 큰 부모일수록 그랬다. 지금은 '리랭크 상위에 들었나' 하나로 정한다.
+        같은 부모의 조각이 여럿 들어도 부모 하나로 모이므로 본문이 중복되지 않고, 한
+        부모가 자리를 독점하지도 않는다.
+
+        부모 순서는 그 부모의 최고 조각 순서다. 합으로 하면 조각이 많은 큰 부모를
+        편들고, 평균으로 하면 많이 걸릴수록 낮은 형제가 섞여 깎인다(실측: 평균으로 했다가
+        recall 93%->83%).
+
+        min_score 아래 조각은 버린다. 전부 걸리면 빈 목록이 나온다 — 문서와 무관한
+        질의라는 뜻이고, 부르는 쪽은 맥락 없이 답하는 경우를 처리해야 한다.
         """
-        contexts = RetrievedContext.from_rows(hits, merge_ratio=merge_ratio)
-        merged = sum(1 for c in contexts if c.merged)
-        logger.info("맥락 조립: 조각 %d개 -> %d개 (승격 %d, 낱개 %d)",
-                    len(hits), len(contexts), merged, len(contexts) - merged)
-        return contexts[:limit] if limit else contexts
-
-    def rerank(self, query: str, contexts: list, top_k: int = 3,
-               max_per_parent: int | None = DEFAULT_MAX_PER_PARENT,
-               min_score: float | None = DEFAULT_MIN_SCORE) -> list:
-        """맥락을 재정렬해 상위 top_k 를 돌려준다.
-
-        max_per_parent 는 한 부모의 조각을 최종 자리에 몇 개까지 담을지다. 점수는
-        전부 계산하고 고를 때만 제한한다 — 리랭크 전에 자르면 정답이 사라진다(실측).
-        None 이면 제한하지 않는다.
-
-        min_score 아래는 버린다. 문서와 무관한 질의여서 전부 걸리면 빈 목록이
-        나오므로, 부르는 쪽은 맥락 없이 답하는 경우를 처리해야 한다.
-        """
-        logger.info("리랭크: %d개 -> top_k=%d (부모당 최대 %s, 최소 점수 %s)",
-                    len(contexts), top_k, max_per_parent or "제한없음",
+        logger.info("리랭크: 조각 %d개 -> 부모 top_k=%d (최소 점수 %s)", len(hits), top_k,
                     min_score if min_score is not None else "없음")
+        texts = [row.get("child_content") or "" for row in hits]
         with self._gpu_lock:
-            ordered = self._reranker.rerank(query, contexts, top_k, max_per_parent,
-                                            min_score)
-        if not ordered and contexts:
+            scored = self._reranker.rerank_texts(query, texts, top_k=None,
+                                                 min_score=min_score)
+
+        children: dict[int, list[RetrievedChild]] = {}
+        heads: dict[int, dict] = {}
+        for index, score in scored:
+            row = hits[index]
+            parent_id = row["parent_id"]
+            if parent_id not in children:
+                if len(children) >= top_k:
+                    continue
+                children[parent_id] = []
+                heads[parent_id] = row
+            children[parent_id].append(RetrievedChild(
+                content=texts[index],
+                similarity=row["similarity"],
+                child_id=row.get("child_id"),
+                rerank_score=score,
+            ))
+
+        contexts = [RetrievedContext.from_parent(heads[pid], kids)
+                    for pid, kids in children.items()]
+        logger.info("리랭크 결과: 부모 %d개 (조각 %d개)", len(contexts),
+                    sum(len(kids) for kids in children.values()))
+        if not contexts and hits:
             logger.info("남은 맥락 없음 — 문서와 무관한 질의로 본다")
-        return ordered
+        return contexts
 
     def rerank_texts(self, query: str, texts: list[str], top_k: int | None = None,
                      min_score: float | None = DEFAULT_MIN_SCORE,
